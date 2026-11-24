@@ -442,11 +442,18 @@ def render_streaming_preview(progress: TurnProgress, *, verbose: bool = True) ->
     """Render an in-progress Telegram HTML status/preview message (<= 4096 chars)."""
     sections: list[str] = []
 
+    total_tools = len(progress.tools)
     active_tools = [t for t in progress.tools if t.state != "DONE"]
     if active_tools:
-        status_header = f"⚙️ <b>AGY 执行中</b>（{html.escape(active_tools[-1].name)}…）"
+        cur_tool = active_tools[-1]
+        step_note = f"第 {total_tools} 步 · " if total_tools > 1 else ""
+        status_header = (
+            f"⚙️ <b>AGY 执行中</b>（{step_note}{html.escape(cur_tool.name)}…）"
+        )
     elif progress.text_preview:
         status_header = "✍️ <b>AGY 输出中…</b>"
+    elif total_tools > 0:
+        status_header = f"⏳ <b>AGY 思考中…</b>（已完成 {total_tools} 个工具调用）"
     else:
         status_header = "⏳ <b>AGY 思考中…</b>"
     sections.append(status_header)

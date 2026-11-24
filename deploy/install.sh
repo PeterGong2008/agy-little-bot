@@ -144,7 +144,7 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     ok "已移除系统级服务：$SYS_UNIT"
   fi
 
-  for bin_name in agy-tg-bot agy-tg-config agy-tg-doctor; do
+  for bin_name in agy-tg-bot agy-tg-config agy-tg-doctor agy-tg-imgsearch; do
     if [[ -L "$LOCAL_BIN/$bin_name" ]]; then
       rm -f "$LOCAL_BIN/$bin_name"
       ok "已移除命令软链：$LOCAL_BIN/$bin_name"
@@ -252,10 +252,32 @@ fi
 ok "Python 依赖安装完成。"
 
 mkdir -p "$LOCAL_BIN"
-for bin_name in agy-tg-bot agy-tg-config agy-tg-doctor; do
+for bin_name in agy-tg-bot agy-tg-config agy-tg-doctor agy-tg-imgsearch; do
   ln -sf "$APP_DIR/.venv/bin/$bin_name" "$LOCAL_BIN/$bin_name"
 done
-ok "已将 agy-tg-bot / agy-tg-config / agy-tg-doctor 软链到 $LOCAL_BIN"
+ok "已将 agy-tg-bot / agy-tg-config / agy-tg-doctor / agy-tg-imgsearch 软链到 $LOCAL_BIN"
+
+# Install bundled AGY skills (web-image-search, fast-image-analysis) and safe allowlist rules
+if [[ -d "$APP_DIR/skills" ]]; then
+  AGY_SKILLS_DIR="$CURRENT_HOME/.gemini/antigravity-cli/skills"
+  mkdir -p "$AGY_SKILLS_DIR"
+  cp -r "$APP_DIR/skills/"* "$AGY_SKILLS_DIR/"
+  ok "已安装内置 AGY Skills 到 $AGY_SKILLS_DIR（联网搜图 + 快速图像分析）"
+fi
+
+"$APP_DIR/.venv/bin/python" -c '
+from agy_tg_bot.env_editor import AgySettingsDocument
+doc = AgySettingsDocument.load()
+allow = doc.get_permissions_list("allow")
+changed = False
+for rule in ("command(agy-tg-imgsearch)", "command(exiftool)"):
+    if rule not in allow:
+        allow.append(rule)
+        changed = True
+if changed:
+    doc.set_permissions_list("allow", allow)
+    doc.save()
+' && ok "已放行 agy-tg-imgsearch 与 exiftool 安全命令规则"
 
 # Offer to persist ~/.local/bin in shell profile if missing
 if [[ ":$PATH:" != *":$LOCAL_BIN:"* ]] || ! grep -qs '\.local/bin' "$CURRENT_HOME/.bashrc" "$CURRENT_HOME/.zshrc" 2>/dev/null; then

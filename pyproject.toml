@@ -27,6 +27,7 @@ dev = [
 agy-tg-bot = "agy_tg_bot.__main__:main"
 agy-tg-config = "agy_tg_bot.cli_config:main"
 agy-tg-doctor = "agy_tg_bot.doctor:main"
+agy-tg-imgsearch = "agy_tg_bot.img_search:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

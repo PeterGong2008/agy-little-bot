@@ -197,6 +197,7 @@ journalctl --user -u agy-telegram-bot -f
 | `/cd [路径]` | 切换 VPS 工作目录；不带参数时弹出可点击的目录浏览器 |
 | `/ls [路径]` | 列出目录中的文件与子目录 |
 | `/get <路径>` | 将 VPS 上的文件直接发送到 Telegram |
+| `/img <关键词>` | 秒级联网搜图并直接发送高清实图到对话（同时 `agy` 自身也已内置 `web-image-search` Skill，可直接对话要求联网搜图） |
 | `/perm [模式]` | 切换工具权限模式：`default` / `auto` / `accept-edits` / `plan` / `danger` |
 | `/sandbox [on\|off]` | 开关 `--sandbox` OS 级终端沙箱 |
 | `/model [slug\|default]` | 调用 `agy models` 展示可点击的模型列表，或直接切换模型 |

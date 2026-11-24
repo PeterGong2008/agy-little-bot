@@ -38,6 +38,7 @@ from .formatting import (
     render_turn_footer,
     render_usage_report_html,
 )
+from .img_search import search_and_download_images
 from .media import collect_turn_images, should_send_as_photo
 from .models import (
     VALID_EFFORT_LEVELS,
@@ -187,6 +188,7 @@ class AgyTelegramBot:
         app.add_handler(CommandHandler("cd", self.cmd_cd))
         app.add_handler(CommandHandler("ls", self.cmd_ls))
         app.add_handler(CommandHandler("get", self.cmd_get))
+        app.add_handler(CommandHandler(["img", "image"], self.cmd_img))
         app.add_handler(CommandHandler(["perm", "mode"], self.cmd_perm))
         app.add_handler(CommandHandler("sandbox", self.cmd_sandbox))
         app.add_handler(CommandHandler("runner", self.cmd_runner))
@@ -234,6 +236,7 @@ class AgyTelegramBot:
             BotCommand("cd", "查看或切换 VPS 工作目录"),
             BotCommand("ls", "列出当前工作区文件"),
             BotCommand("get", "下载 VPS 文件到 Telegram"),
+            BotCommand("img", "快速联网搜图并发送到对话"),
             BotCommand("perm", "切换 AGY 工具权限模式"),
             BotCommand("sandbox", "开关终端 OS 沙箱 (--sandbox)"),
             BotCommand("model", "查看/切换模型"),
@@ -357,6 +360,7 @@ class AgyTelegramBot:
             "• /cd <code>[路径]</code> — 切换或浏览工作目录\n"
             "• /ls <code>[路径]</code> — 查看目录内容\n"
             "• /get <code>&lt;路径&gt;</code> — 下载 VPS 任意文件到 Telegram\n"
+            "• /img <code>&lt;关键词&gt;</code> — 秒级联网搜图并直接发送到对话\n"
             "• 直接发送图片/文件 — 自动保存到工作区 <code>.tg_inbox/</code> 并交给 agy 读取\n\n"
             "<b>权限与模型配置</b>\n"
             "• /perm <code>[default|auto|accept-edits|plan|danger]</code> — 切换工具权限\n"
@@ -694,6 +698,57 @@ class AgyTelegramBot:
                 filename=target.name,
                 caption=f"📎 {target}",
             )
+
+    async def cmd_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Quick web image search & direct Telegram delivery (`/img <keywords>`)."""
+        if not await self._authorize(update):
+            return
+        msg = update.effective_message
+        key = _extract_session_key(update)
+        if msg is None or key is None:
+            return
+        query = " ".join(context.args).strip() if context.args else ""
+        if not query:
+            await self._safe_reply_html(
+                msg,
+                "用法：<code>/img &lt;搜索关键词&gt;</code>\n"
+                "示例：<code>/img 新皇岗口岸 效果图</code>",
+            )
+            return
+
+        session = self.store.get_or_create_session(key, self.config)
+        ws = Path(session.workspace)
+        out_dir = (ws if ws.is_dir() else Path(self.config.default_workspace)) / "web_images"
+        status_msg = await self._safe_reply_html(
+            msg, f"🔎 正在联网搜图：<code>{html.escape(query)}</code>…"
+        )
+
+        try:
+            items = await asyncio.to_thread(
+                search_and_download_images,
+                query,
+                out_dir=out_dir,
+                count=3,
+            )
+        except Exception as exc:
+            await self._safe_edit_html(status_msg, f"❌ 联网搜图失败：{html.escape(str(exc))}")
+            return
+
+        if not items:
+            await self._safe_edit_html(
+                status_msg,
+                f"⚠️ 未找到可下载的有效图片：<code>{html.escape(query)}</code>，请尝试更换关键词。",
+            )
+            return
+
+        await self._safe_edit_html(
+            status_msg,
+            f"🖼 已找到 <b>{len(items)}</b> 张关于 <code>{html.escape(query)}</code> 的图片，正在发送…",
+        )
+        for item in items:
+            title_part = f"{item.title}\n" if item.title else ""
+            caption = f"🖼 {title_part}{item.source_url}"[:1000]
+            await self._safe_send_image(msg, Path(item.local_path), caption=caption)
 
     async def cmd_perm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -1942,11 +1997,27 @@ class AgyTelegramBot:
         caption = (msg.caption or "").strip()
         rel_path = dest.relative_to(ws)
         size_label = _human_size(dest.stat().st_size) if dest.exists() else "?"
-        prompt_header = (
-            f"[用户通过 Telegram 上传了附件，已保存到工作区路径: {rel_path} "
-            f"(绝对路径: {dest}, MIME: {mime_type}, 大小: {size_label})]\n"
-            "请先读取该文件再回答用户。"
-        )
+        is_image = mime_type.startswith("image/") or dest.suffix.lower() in {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+            ".bmp",
+        }
+        if is_image:
+            prompt_header = (
+                f"[用户通过 Telegram 上传了图片，已保存到工作区路径: {rel_path} "
+                f"(绝对路径: {dest}, MIME: {mime_type}, 大小: {size_label})]\n"
+                "请先用 read_file 直接查看图片。若需局部放大看小字，可直接用 python3 的 PIL(Pillow) "
+                "一步裁剪保存到 /tmp/crop.jpg 后查看；若需联网验证，请精简控制在 2~4 次搜索内并尽快给出明确结论，不要无限循环盲搜。"
+            )
+        else:
+            prompt_header = (
+                f"[用户通过 Telegram 上传了附件，已保存到工作区路径: {rel_path} "
+                f"(绝对路径: {dest}, MIME: {mime_type}, 大小: {size_label})]\n"
+                "请先读取该文件再回答用户。"
+            )
         prompt = f"{prompt_header}\n\n{caption}" if caption else f"{prompt_header}\n\n请分析此文件内容。"
         await self._execute_prompt(msg, key, prompt)
 
