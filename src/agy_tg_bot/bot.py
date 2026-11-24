@@ -30,10 +30,13 @@ from .agy_client import AgyRunner
 from .config import BotConfig
 from .formatting import (
     TELEGRAM_MAX_MESSAGE_LEN,
+    ModelFamily,
     format_token_count,
+    group_models_by_family,
     render_streaming_preview,
     render_telegram_html_chunks,
     render_turn_footer,
+    render_usage_report_html,
 )
 from .media import collect_turn_images, should_send_as_photo
 from .models import (
@@ -114,7 +117,17 @@ class AgyTelegramBot:
         self.runner = runner
         self._session_locks: dict[SessionKey, asyncio.Lock] = {}
         self._model_cache: dict[SessionKey, list[tuple[str, str]]] = {}
-        self._cd_cache: dict[SessionKey, list[str]] = {}
+        self._model_families_cache: dict[SessionKey, list[ModelFamily]] = {}
+        self._agent_cache: dict[SessionKey, list[tuple[str, str]]] = {}
+        self._cd_cache: dict[SessionKey, list[tuple[str, str]]] = {}
+
+    def _format_model_display(self, key: SessionKey, slug: str | None) -> str:
+        if not slug:
+            return "CLI 默认"
+        for cached_slug, label in self._model_cache.get(key) or ():
+            if cached_slug == slug:
+                return f"{label} ({slug})" if label != slug else slug
+        return slug
 
     def _get_lock(self, key: SessionKey) -> asyncio.Lock:
         lock = self._session_locks.get(key)
@@ -266,17 +279,19 @@ class AgyTelegramBot:
         cid_short = session.conversation_id[:8] if session.conversation_id else "新会话"
         runner_label = "常驻流式" if session.runner_mode == "persistent" else "单次按需"
 
+        model_disp = self._format_model_display(key, session.model)
         text = (
             "🎛 <b>AGY 交互式控制面板</b>\n"
             f"• 状态：{busy_badge} | 进程：{worker_badge}\n"
             f"• 工作区：<code>{html.escape(session.workspace)}</code>\n"
             f"• 对话 ID：<code>{html.escape(cid_short)}</code>\n"
-            f"• 模型：<code>{html.escape(session.model or 'CLI 默认')}</code>"
+            f"• 模型：<code>{html.escape(model_disp)}</code>"
             f" | 强度：<code>{html.escape(session.effort or '默认')}</code>\n"
-            f"• 权限：<code>{html.escape(session.permission_mode)}</code>"
-            f" | 沙箱：{'✅' if session.sandbox else '❌'}"
-            f" | 引擎：<code>{html.escape(session.runner_mode)}</code>\n"
-            f"• 详细轨迹：{'✅' if session.verbose else '❌'}"
+            f"• Agent：<code>{html.escape(session.agent or '默认')}</code>"
+            f" | 权限：<code>{html.escape(session.permission_mode)}</code>"
+            f" | 沙箱：{'✅' if session.sandbox else '❌'}\n"
+            f"• 引擎：<code>{html.escape(session.runner_mode)}</code>"
+            f" | 详细轨迹：{'✅' if session.verbose else '❌'}"
             f" | 自动发图：{'✅' if self.config.auto_send_images else '❌'}\n\n"
             "<i>点击下方按钮快速切换设置，或直接发送文字/图片开始对话。</i>"
         )
@@ -302,6 +317,10 @@ class AgyTelegramBot:
                 InlineKeyboardButton("📜 历史会话", callback_data="menu:history"),
             ],
             [
+                InlineKeyboardButton("🤖 切换 Agent", callback_data="menu:agent"),
+                InlineKeyboardButton("📊 配额用量", callback_data="menu:usage"),
+            ],
+            [
                 InlineKeyboardButton(
                     f"⚙️ 引擎: {runner_label}",
                     callback_data="menu:toggle_runner",
@@ -312,11 +331,10 @@ class AgyTelegramBot:
                 ),
             ],
             [
-                InlineKeyboardButton("📊 配额用量", callback_data="menu:usage"),
                 InlineKeyboardButton("♻️ 重启进程", callback_data="menu:restart"),
+                InlineKeyboardButton("❓ 命令帮助", callback_data="menu:help"),
             ],
             [
-                InlineKeyboardButton("❓ 命令帮助", callback_data="menu:help"),
                 InlineKeyboardButton("✖️ 关闭面板", callback_data="menu:close"),
             ],
         ]
@@ -423,6 +441,7 @@ class AgyTelegramBot:
         perm_desc = PERM_DESCRIPTIONS.get(session.permission_mode, session.permission_mode)
         cid = session.conversation_id or "（尚未开始）"
 
+        model_disp = self._format_model_display(key, session.model)
         text = (
             "📊 <b>AGY 会话状态</b>\n"
             f"• 状态：{busy_state} | 后台进程：{worker_state}\n"
@@ -430,14 +449,18 @@ class AgyTelegramBot:
             f"• 对话 ID：<code>{html.escape(cid)}</code>\n"
             f"• 权限模式：<code>{html.escape(session.permission_mode)}</code> — {html.escape(perm_desc)}\n"
             f"• 终端沙箱：{'✅ 开启 (--sandbox)' if session.sandbox else '❌ 关闭'}\n"
-            f"• 模型：<code>{html.escape(session.model or 'CLI 默认')}</code>\n"
+            f"• 模型：<code>{html.escape(model_disp)}</code>\n"
             f"• 推理强度：<code>{html.escape(session.effort or 'CLI 默认')}</code>\n"
             f"• Agent：<code>{html.escape(session.agent or '默认')}</code>\n"
             f"• 引擎模式：<code>{html.escape(session.runner_mode)}</code>"
             f"（全局热进程数：{self.runner.active_worker_count()}）\n"
-            f"• 详细输出：{'✅ 开启' if session.verbose else '❌ 简洁'}"
+            f"• 详细输出：{'✅ 开启' if session.verbose else '❌ 简洁'} | "
+            f"自动发图：{'✅ 开启' if self.config.auto_send_images else '❌ 关闭'}"
         )
-        await self._safe_reply_html(msg, text)
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🎛 打开交互式控制面板", callback_data="menu:home")]]
+        )
+        await self._safe_reply_html(msg, text, reply_markup=markup)
 
     async def cmd_cd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -464,43 +487,69 @@ class AgyTelegramBot:
         *,
         edit: bool = False,
         include_back: bool = True,
+        page: int = 0,
+        refresh_cache: bool = True,
     ) -> None:
         cwd = Path(session.workspace)
-        choices: list[tuple[str, str]] = []
-        parent = cwd.parent
-        if parent != cwd and self.config.is_path_allowed(parent):
-            choices.append(("⬆️ .. (上级目录)", str(parent)))
+        if refresh_cache or key not in self._cd_cache:
+            choices: list[tuple[str, str]] = []
+            parent = cwd.parent
+            if parent != cwd and self.config.is_path_allowed(parent):
+                choices.append(("⬆️ .. (上级目录)", str(parent)))
 
-        try:
-            subdirs = sorted(
-                (p for p in cwd.iterdir() if p.is_dir() and not p.name.startswith(".")),
-                key=lambda p: p.name.lower(),
-            )[:12]
-        except OSError:
-            subdirs = []
+            try:
+                subdirs = sorted(
+                    (p for p in cwd.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                    key=lambda p: p.name.lower(),
+                )
+            except OSError:
+                subdirs = []
 
-        for sub in subdirs:
-            if self.config.is_path_allowed(sub):
-                choices.append((f"📁 {sub.name}", str(sub)))
+            for sub in subdirs:
+                if self.config.is_path_allowed(sub):
+                    choices.append((f"📁 {sub.name}", str(sub)))
+            self._cd_cache[key] = choices
+        else:
+            choices = self._cd_cache[key]
 
-        self._cd_cache[key] = [path_str for _, path_str in choices]
         rows: list[list[InlineKeyboardButton]] = []
-        for idx, (label, _) in enumerate(choices):
-            btn = InlineKeyboardButton(label[:32], callback_data=f"cd:{idx}")
-            if idx == 0 and label.startswith("⬆️"):
-                rows.append([btn])
-            elif rows and len(rows[-1]) < 2 and not rows[-1][0].text.startswith("⬆️"):
+        has_parent = bool(choices and choices[0][0].startswith("⬆️"))
+        if has_parent:
+            rows.append([InlineKeyboardButton(choices[0][0], callback_data="cd:0")])
+
+        sub_offset = 1 if has_parent else 0
+        sub_items = choices[sub_offset:]
+        page_size = 10
+        total_pages = max(1, (len(sub_items) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        start = page * page_size
+        end = start + page_size
+
+        for rel_i, (label, _) in enumerate(sub_items[start:end]):
+            abs_idx = sub_offset + start + rel_i
+            btn = InlineKeyboardButton(label[:32], callback_data=f"cd:{abs_idx}")
+            if rows and len(rows[-1]) < 2 and not rows[-1][0].text.startswith("⬆️"):
                 rows[-1].append(btn)
             else:
                 rows.append([btn])
+
+        if total_pages > 1:
+            nav: list[InlineKeyboardButton] = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"cd_page:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="menu:noop"))
+            if page + 1 < total_pages:
+                nav.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"cd_page:{page + 1}"))
+            rows.append(nav)
 
         if include_back:
             rows.append(self._back_to_panel_row())
 
         markup = InlineKeyboardMarkup(rows) if rows else None
+        count_note = f"（共 {len(sub_items)} 个子目录）" if sub_items else "（无子目录）"
         text = (
             f"📂 当前工作目录：<code>{html.escape(session.workspace)}</code>\n"
-            "点击下方目录快速切换，或输入 <code>/cd &lt;路径&gt;</code>。"
+            f"点击下方目录快速切换{count_note}，或输入 <code>/cd &lt;路径&gt;</code>。"
         )
         if edit:
             await self._safe_edit_html(msg, text, reply_markup=markup)
@@ -576,21 +625,40 @@ class AgyTelegramBot:
             await self._safe_reply_html(msg, f"❌ 读取目录失败：{html.escape(str(exc))}")
             return
 
-        lines: list[str] = [f"📁 <b>{html.escape(str(target))}</b> ({len(entries)} 项)"]
-        for entry in entries[:60]:
+        dir_count = sum(1 for e in entries if e.is_dir())
+        file_count = len(entries) - dir_count
+        lines: list[str] = [
+            f"📁 <b>{html.escape(str(target))}</b>（{dir_count} 个目录，{file_count} 个文件）"
+        ]
+        total_len = len(lines[0])
+        shown = 0
+        for entry in entries:
             if entry.is_dir():
-                lines.append(f"  📂 <code>{html.escape(entry.name)}/</code>")
+                line = f"  📂 <code>{html.escape(entry.name)}/</code>"
             else:
                 try:
-                    size = entry.stat().st_size
-                    size_str = _human_size(size)
+                    size_str = _human_size(entry.stat().st_size)
                 except OSError:
                     size_str = "?"
-                lines.append(f"  📄 <code>{html.escape(entry.name)}</code> ({size_str})")
-        if len(entries) > 60:
-            lines.append(f"<i>… 其余 {len(entries) - 60} 项未显示</i>")
+                line = f"  📄 <code>{html.escape(entry.name)}</code> ({size_str})"
+            if shown >= 80 or total_len + len(line) + 60 > TELEGRAM_MAX_MESSAGE_LEN:
+                break
+            lines.append(line)
+            total_len += len(line) + 1
+            shown += 1
 
-        await self._safe_reply_html(msg, "\n".join(lines))
+        if shown < len(entries):
+            lines.append(f"<i>… 其余 {len(entries) - shown} 项未显示</i>")
+
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📂 切换目录", callback_data="menu:cd"),
+                    InlineKeyboardButton("🎛 控制面板", callback_data="menu:home"),
+                ]
+            ]
+        )
+        await self._safe_reply_html(msg, "\n".join(lines), reply_markup=markup)
 
     async def cmd_get(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -849,7 +917,33 @@ class AgyTelegramBot:
             )
             return
 
+        if not models:
+            await self._safe_edit_html(
+                target_msg,
+                "⚠️ 未解析到可用模型列表，请检查 <code>agy models</code> 输出或手动执行 "
+                "<code>/model &lt;slug&gt;</code>。",
+                reply_markup=back_markup,
+            )
+            return
+
         self._model_cache[key] = models
+        self._model_families_cache[key] = group_models_by_family(models)
+        await self._render_model_families_view(
+            target_msg, key, session, include_back=include_back
+        )
+
+    async def _render_model_families_view(
+        self,
+        target_msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        *,
+        include_back: bool = True,
+    ) -> None:
+        models = self._model_cache.get(key) or []
+        families = self._model_families_cache.get(key) or group_models_by_family(models)
+        self._model_families_cache[key] = families
+
         rows: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton(
@@ -858,16 +952,141 @@ class AgyTelegramBot:
                 )
             ]
         ]
-        for idx, (slug, label) in enumerate(models[:20]):
-            mark = "✅ " if session.model == slug else ""
-            rows.append([InlineKeyboardButton(f"{mark}{label}"[:48], callback_data=f"model:{idx}")])
-        if include_back:
-            rows.append(self._back_to_panel_row())
 
-        cur = session.model or "CLI 默认"
+        fam_buttons: list[InlineKeyboardButton] = []
+        for fam_idx, fam in enumerate(families):
+            is_active = any(v.slug == session.model for v in fam.variants)
+            mark = "✅ " if is_active else ""
+            if len(fam.variants) == 1:
+                v = fam.variants[0]
+                fam_buttons.append(
+                    InlineKeyboardButton(f"{mark}{fam.name}"[:32], callback_data=f"model:{v.index}")
+                )
+            else:
+                fam_buttons.append(
+                    InlineKeyboardButton(
+                        f"{mark}{fam.name} ({len(fam.variants)})"[:32],
+                        callback_data=f"model_fam:{fam_idx}",
+                    )
+                )
+
+        for i in range(0, len(fam_buttons), 2):
+            rows.append(fam_buttons[i : i + 2])
+
+        footer_row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(f"📋 全部列表 ({len(models)})", callback_data="model_all:0")
+        ]
+        if include_back:
+            footer_row.append(InlineKeyboardButton("⬅️ 返回主面板", callback_data="menu:home"))
+        rows.append(footer_row)
+
+        cur_disp = self._format_model_display(key, session.model)
         await self._safe_edit_html(
             target_msg,
-            f"🧠 当前模型：<code>{html.escape(cur)}</code>\n点击下方按钮切换，或执行 <code>/model &lt;slug&gt;</code>：",
+            f"🧠 <b>选择模型系列</b>（共 {len(models)} 个可用模型）\n"
+            f"当前模型：<code>{html.escape(cur_disp)}</code>\n"
+            "点击系列进入选择推理档位，或执行 <code>/model &lt;slug&gt;</code>：",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _render_model_variants_view(
+        self,
+        target_msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        fam_idx: int,
+    ) -> None:
+        families = self._model_families_cache.get(key) or []
+        if not (0 <= fam_idx < len(families)):
+            await self._safe_edit_html(
+                target_msg,
+                "⚠️ 模型列表已过期，请重新点击切换模型或发送 /model。",
+                reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+            )
+            return
+
+        fam = families[fam_idx]
+        rows: list[list[InlineKeyboardButton]] = []
+        v_buttons: list[InlineKeyboardButton] = []
+        for v in fam.variants:
+            mark = "✅ " if session.model == v.slug else ""
+            v_buttons.append(
+                InlineKeyboardButton(f"{mark}{v.variant}"[:32], callback_data=f"model:{v.index}")
+            )
+        for i in range(0, len(v_buttons), 2):
+            rows.append(v_buttons[i : i + 2])
+
+        rows.append(
+            [
+                InlineKeyboardButton("⬅️ 模型系列", callback_data="model_back"),
+                InlineKeyboardButton("🏠 主面板", callback_data="menu:home"),
+            ]
+        )
+
+        variant_lines = "\n".join(
+            f"• {'✅ ' if session.model == v.slug else ''}<b>{html.escape(v.variant)}</b> — <code>{html.escape(v.slug)}</code>"
+            for v in fam.variants
+        )
+        await self._safe_edit_html(
+            target_msg,
+            f"🧠 <b>{html.escape(fam.name)}</b>\n{variant_lines}\n\n请选择档位：",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _render_model_all_view(
+        self,
+        target_msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        page: int,
+    ) -> None:
+        models = self._model_cache.get(key) or []
+        if not models:
+            await self._open_model_picker(target_msg, key, session, include_back=True)
+            return
+
+        page_size = 10
+        total_pages = max(1, (len(models) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        start = page * page_size
+        end = start + page_size
+
+        rows: list[list[InlineKeyboardButton]] = []
+        if page == 0:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        ("✅ " if session.model is None else "") + "CLI 默认模型",
+                        callback_data="model:default",
+                    )
+                ]
+            )
+        for idx in range(start, min(end, len(models))):
+            slug, label = models[idx]
+            mark = "✅ " if session.model == slug else ""
+            rows.append([InlineKeyboardButton(f"{mark}{label}"[:48], callback_data=f"model:{idx}")])
+
+        if total_pages > 1:
+            nav: list[InlineKeyboardButton] = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"model_all:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="menu:noop"))
+            if page + 1 < total_pages:
+                nav.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"model_all:{page + 1}"))
+            rows.append(nav)
+
+        rows.append(
+            [
+                InlineKeyboardButton("🗂 分组视图", callback_data="model_back"),
+                InlineKeyboardButton("🏠 主面板", callback_data="menu:home"),
+            ]
+        )
+
+        cur_disp = self._format_model_display(key, session.model)
+        await self._safe_edit_html(
+            target_msg,
+            f"🧠 <b>全部可用模型</b>（第 {page + 1}/{total_pages} 页，共 {len(models)} 个）\n"
+            f"当前模型：<code>{html.escape(cur_disp)}</code>",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -880,15 +1099,37 @@ class AgyTelegramBot:
         *,
         edit: bool,
     ) -> None:
-        if session.model != model:
+        effort_cleared = False
+        changed = session.model != model
+        if model is not None:
+            # If the chosen slug already encodes an effort suffix (e.g. -high / -xhigh),
+            # clear separate --effort override to prevent `invalid model selection` conflicts.
+            if any(model.lower().endswith(f"-{lvl}") for lvl in VALID_EFFORT_LEVELS):
+                if session.effort is not None:
+                    session.effort = None
+                    effort_cleared = True
+                    changed = True
+
+        if changed:
             session.model = model
             self.store.save_session(session)
             await self.runner.close_worker(key, graceful=True)
-        label = model or "CLI 默认"
-        text = f"🧠 已设置模型为：<code>{html.escape(label)}</code>"
+
+        disp = self._format_model_display(key, model)
+        note = "\n<i>已自动清除独立推理强度覆盖，改用模型自带档位。</i>" if effort_cleared else ""
+        text = f"🧠 已设置模型为：<code>{html.escape(disp)}</code>{note}"
         if edit:
             await self._safe_edit_html(
-                msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
+                msg,
+                text,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("🧠 继续选模型", callback_data="model_back"),
+                            InlineKeyboardButton("🏠 返回主面板", callback_data="menu:home"),
+                        ]
+                    ]
+                ),
             )
         else:
             await self._safe_reply_html(msg, text)
@@ -953,11 +1194,34 @@ class AgyTelegramBot:
         *,
         edit: bool,
     ) -> None:
-        if session.effort != effort:
-            session.effort = effort
+        # If current model slug embeds an effort suffix (e.g. gemini-4-hydrogen-high) and a
+        # sibling slug with the target effort exists in available models, switch directly to it.
+        swapped_model: str | None = None
+        if effort is not None and session.model:
+            low_model = session.model.lower()
+            for suffix in VALID_EFFORT_LEVELS:
+                if low_model.endswith(f"-{suffix}"):
+                    base = session.model[: -(len(suffix) + 1)]
+                    candidate = f"{base}-{effort}"
+                    known_slugs = {s for s, _ in (self._model_cache.get(key) or ())}
+                    if candidate in known_slugs:
+                        swapped_model = candidate
+                    break
+
+        if swapped_model is not None:
+            session.model = swapped_model
+            session.effort = None
             self.store.save_session(session)
             await self.runner.close_worker(key, graceful=True)
-        text = f"⚡ 推理强度已设为：<code>{html.escape(effort or 'CLI 默认')}</code>"
+            disp = self._format_model_display(key, swapped_model)
+            text = f"⚡ 已自动切换至同系列档位模型：<code>{html.escape(disp)}</code>"
+        else:
+            if session.effort != effort:
+                session.effort = effort
+                self.store.save_session(session)
+                await self.runner.close_worker(key, graceful=True)
+            text = f"⚡ 推理强度已设为：<code>{html.escape(effort or 'CLI 默认')}</code>"
+
         if edit:
             await self._safe_edit_html(
                 msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
@@ -977,29 +1241,77 @@ class AgyTelegramBot:
         if context.args:
             chosen = context.args[0].strip()
             new_agent = None if chosen.lower() in {"default", "reset", "none"} else chosen
-            if session.agent != new_agent:
-                session.agent = new_agent
-                self.store.save_session(session)
-                await self.runner.close_worker(key, graceful=True)
-            await self._safe_reply_html(
-                msg, f"🤖 Agent 已设为：<code>{html.escape(new_agent or '默认')}</code>"
+            await self._set_agent(msg, key, session, new_agent, edit=False)
+            return
+
+        status_msg = await self._safe_reply_html(msg, "🔍 正在查询 <code>agy agents</code>…")
+        await self._open_agent_picker(status_msg, key, session, include_back=True)
+
+    async def _open_agent_picker(
+        self,
+        target_msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        *,
+        include_back: bool = True,
+    ) -> None:
+        agents, err = await self.runner.list_agents(cwd=session.workspace)
+        back_markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if include_back else None
+        if err:
+            await self._safe_edit_html(
+                target_msg,
+                f"🤖 当前 Agent：<code>{html.escape(session.agent or '默认')}</code>\n"
+                f"❌ 获取列表失败：\n<pre>{html.escape(err[:1000])}</pre>",
+                reply_markup=back_markup,
             )
             return
 
-        out, err = await self.runner.list_agents(cwd=session.workspace)
-        if err:
-            await self._safe_reply_html(
-                msg,
-                f"🤖 当前 Agent：<code>{html.escape(session.agent or '默认')}</code>\n"
-                f"获取列表失败：<pre>{html.escape(err[:1000])}</pre>",
-            )
-            return
-        body = html.escape(out[:2500] or "（未发现自定义 Agent）")
-        await self._safe_reply_html(
-            msg,
-            f"🤖 当前 Agent：<code>{html.escape(session.agent or '默认')}</code>\n"
-            f"<pre>{body}</pre>\n使用 <code>/agent &lt;name&gt;</code> 或 <code>/agent default</code> 切换。",
+        self._agent_cache[key] = agents
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    ("✅ " if session.agent is None else "") + "默认 Agent",
+                    callback_data="agent:default",
+                )
+            ]
+        ]
+        lines = [f"🤖 <b>自定义 Agent</b>\n当前：<code>{html.escape(session.agent or '默认')}</code>"]
+        if not agents:
+            lines.append("\n<i>当前工作区与全局配置下暂无自定义 Agent。</i>")
+        else:
+            lines.append("")
+            for idx, (name, desc) in enumerate(agents[:20]):
+                mark = "✅ " if session.agent == name else ""
+                desc_part = f" — {html.escape(desc[:80])}" if desc and desc != name else ""
+                lines.append(f"• {mark}<code>{html.escape(name)}</code>{desc_part}")
+                rows.append([InlineKeyboardButton(f"{mark}{name}"[:40], callback_data=f"agent:{idx}")])
+
+        if include_back:
+            rows.append(self._back_to_panel_row())
+        await self._safe_edit_html(
+            target_msg, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows)
         )
+
+    async def _set_agent(
+        self,
+        msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        agent: str | None,
+        *,
+        edit: bool,
+    ) -> None:
+        if session.agent != agent:
+            session.agent = agent
+            self.store.save_session(session)
+            await self.runner.close_worker(key, graceful=True)
+        text = f"🤖 Agent 已设为：<code>{html.escape(agent or '默认')}</code>"
+        if edit:
+            await self._safe_edit_html(
+                msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
+            )
+        else:
+            await self._safe_reply_html(msg, text)
 
     async def cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -1015,32 +1327,46 @@ class AgyTelegramBot:
     async def _open_usage_view(
         self, target_msg: Message, session: SessionState, *, include_back: bool = True
     ) -> None:
-        back_markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if include_back else None
+        action_row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton("🔄 刷新用量", callback_data="menu:usage")
+        ]
+        if include_back:
+            action_row.append(InlineKeyboardButton("⬅️ 返回主面板", callback_data="menu:home"))
+        markup = InlineKeyboardMarkup([action_row])
+
         report, err = await self.runner.get_usage_report(cwd=session.workspace)
         if err:
             await self._safe_edit_html(
                 target_msg,
                 f"❌ 查询用量失败：\n<pre>{html.escape(err[:2000])}</pre>",
-                reply_markup=back_markup,
+                reply_markup=markup,
             )
             return
-        await self._safe_edit_html(
-            target_msg,
-            f"📊 <b>AGY 配额与用量</b>\n<pre>{html.escape(report[:3500])}</pre>",
-            reply_markup=back_markup,
-        )
+        formatted = render_usage_report_html(report)
+        await self._safe_edit_html(target_msg, formatted, reply_markup=markup)
 
     def _build_history_view(
-        self, key: SessionKey, session: SessionState, *, include_back: bool = True
+        self,
+        key: SessionKey,
+        session: SessionState,
+        *,
+        include_back: bool = True,
+        page: int = 0,
     ) -> tuple[str, InlineKeyboardMarkup | None]:
-        records = self.store.list_conversations(key, limit=8)
+        records = self.store.list_conversations(key, limit=40)
         if not records:
             markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if include_back else None
             return "📜 暂无历史会话记录。", markup
 
-        lines = ["📜 <b>最近会话记录</b>（点击按钮直接恢复）："]
+        page_size = 6
+        total_pages = max(1, (len(records) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        page_records = records[page * page_size : (page + 1) * page_size]
+
+        page_suffix = f"（第 {page + 1}/{total_pages} 页，共 {len(records)} 条）" if total_pages > 1 else ""
+        lines = [f"📜 <b>最近会话记录</b>{page_suffix}："]
         rows: list[list[InlineKeyboardButton]] = []
-        for rec in records:
+        for rec in page_records:
             active_mark = "🟢 " if rec.conversation_id == session.conversation_id else ""
             short_id = rec.conversation_id[:8]
             ts = _format_timestamp(rec.updated_at)
@@ -1054,6 +1380,16 @@ class AgyTelegramBot:
             rows.append(
                 [InlineKeyboardButton(btn_label, callback_data=f"resume:{rec.conversation_id[:36]}")]
             )
+
+        if total_pages > 1:
+            nav: list[InlineKeyboardButton] = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"hist_page:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="menu:noop"))
+            if page + 1 < total_pages:
+                nav.append(InlineKeyboardButton("➡️ 下一页", callback_data=f"hist_page:{page + 1}"))
+            rows.append(nav)
+
         if include_back:
             rows.append(self._back_to_panel_row())
         return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -1269,6 +1605,29 @@ class AgyTelegramBot:
                 await self._set_effort(msg, key, session, lvl, edit=True)
             return
 
+        if data == "model_back":
+            if self._model_cache.get(key):
+                await self._render_model_families_view(msg, key, session, include_back=True)
+            else:
+                await self._open_model_picker(msg, key, session, include_back=True)
+            return
+
+        if data.startswith("model_fam:"):
+            try:
+                fam_idx = int(data.split(":", 1)[1])
+            except ValueError:
+                return
+            await self._render_model_variants_view(msg, key, session, fam_idx)
+            return
+
+        if data.startswith("model_all:"):
+            try:
+                page = int(data.split(":", 1)[1])
+            except ValueError:
+                page = 0
+            await self._render_model_all_view(msg, key, session, page)
+            return
+
         if data.startswith("model:"):
             raw = data.split(":", 1)[1]
             if raw == "default":
@@ -1288,15 +1647,53 @@ class AgyTelegramBot:
             await self._set_model(msg, key, session, slug, edit=True)
             return
 
+        if data.startswith("agent:"):
+            raw = data.split(":", 1)[1]
+            if raw == "default":
+                await self._set_agent(msg, key, session, None, edit=True)
+                return
+            try:
+                idx = int(raw)
+                cached_agents = self._agent_cache.get(key) or []
+                agent_name = cached_agents[idx][0]
+            except (ValueError, IndexError):
+                await self._safe_edit_html(
+                    msg,
+                    "⚠️ Agent 列表已过期，请重新发送 /agent。",
+                    reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+                )
+                return
+            await self._set_agent(msg, key, session, agent_name, edit=True)
+            return
+
         if data.startswith("resume:"):
             cid = data.split(":", 1)[1]
             await self._apply_resume(msg, key, cid, edit=True)
             return
 
+        if data.startswith("hist_page:"):
+            try:
+                page = int(data.split(":", 1)[1])
+            except ValueError:
+                page = 0
+            text, markup = self._build_history_view(key, session, include_back=True, page=page)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if data.startswith("cd_page:"):
+            try:
+                page = int(data.split(":", 1)[1])
+            except ValueError:
+                page = 0
+            await self._send_cd_browser(
+                msg, key, session, edit=True, include_back=True, page=page, refresh_cache=False
+            )
+            return
+
         if data.startswith("cd:"):
             try:
                 idx = int(data.split(":", 1)[1])
-                path_str = (self._cd_cache.get(key) or [])[idx]
+                _, path_str = (self._cd_cache.get(key) or [])[idx]
             except (ValueError, IndexError):
                 await self._safe_edit_html(
                     msg,
@@ -1415,11 +1812,23 @@ class AgyTelegramBot:
             await self._safe_edit_html(msg, text, reply_markup=markup)
             return
 
+        if action == "agent":
+            with contextlib.suppress(TelegramError):
+                await query.answer("正在查询 Agent 列表…")
+            await self._safe_edit_html(msg, "🔍 正在查询 <code>agy agents</code>…")
+            await self._open_agent_picker(msg, key, session, include_back=True)
+            return
+
         if action == "usage":
             with contextlib.suppress(TelegramError):
                 await query.answer("正在查询用量…")
             await self._safe_edit_html(msg, "📊 正在查询 <code>agy -p /usage</code>…")
             await self._open_usage_view(msg, session, include_back=True)
+            return
+
+        if action == "noop":
+            with contextlib.suppress(TelegramError):
+                await query.answer()
             return
 
         if action == "help":

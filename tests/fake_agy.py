@@ -257,17 +257,26 @@ def main() -> int:
     parsed = _parse_args(sys.argv[1:])
 
     if parsed["subcmd"] == "models":
-        print("gemini-4-neon-xhigh            Gemini 4 Neon (XHigh)")
-        print("gemini-3.8-flash-medium        Gemini 3.8 Flash (Medium)")
+        sys.stderr.write("Fetching available models...\n")
+        print("gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)")
+        print("gemini-4-neon-high\tGemini 4 Neon (High)")
+        print("gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)")
+        print("gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)")
+        print("gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)")
+        print("claude-opus-5-5-high\tClaude Opus 5.5 (High)")
+        print("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)")
         return 0
 
     if parsed["subcmd"] == "agents":
-        print("default   General purpose coding agent")
-        print("reviewer  Strict code review agent")
+        print("default\tGeneral purpose coding agent")
+        print("reviewer\tStrict code review agent")
         return 0
 
     if parsed["prompt"] == "/usage":
-        print("Plan: Google AI Pro\nRemaining quota: 92%")
+        print("Gemini Models\tWeekly Limit Remaining\t90%\t2026-12-01T07:40:02Z")
+        print("Gemini Models\tFive Hour Limit Remaining\t62%\t2026-11-24T12:40:02Z")
+        print("Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-12-01T08:57:49Z")
+        print("Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-11-24T13:57:49Z")
         return 0
 
     conv_id = parsed["conversation"] or str(uuid.uuid4())

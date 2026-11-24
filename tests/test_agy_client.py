@@ -185,18 +185,20 @@ async def test_standalone_cli_helpers(tmp_path: Path) -> None:
 
     models, err = await runner.list_models(cwd=str(tmp_path))
     assert err is None
-    assert models == [
-        ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
-        ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
-    ]
+    assert ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)") in models
+    assert ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)") in models
+    assert ("claude-opus-5-5-high", "Claude Opus 5.5 (High)") in models
+    assert ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)") in models
+    assert len(models) == 7
 
     agents, err = await runner.list_agents(cwd=str(tmp_path))
     assert err is None
-    assert "reviewer" in agents
+    assert ("reviewer", "Strict code review agent") in agents
 
     usage, err = await runner.get_usage_report(cwd=str(tmp_path))
     assert err is None
-    assert "92%" in usage
+    assert "90%" in usage
+    assert "62%" in usage
 
 
 @pytest.mark.asyncio

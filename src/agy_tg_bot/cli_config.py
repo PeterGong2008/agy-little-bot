@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
-from .agy_client import AgyRunner
+from .agy_client import AgyRunner, parse_cli_pairs
 from .config import load_config, resolve_agy_binary
 from .doctor import run_doctor
 from .env_editor import (
@@ -767,12 +767,7 @@ class InteractiveConfigCLI:
                 return [], str(exc)
             if proc.returncode != 0:
                 return [], (proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}")
-            out: list[tuple[str, str]] = []
-            for ln in proc.stdout.splitlines():
-                parts = ln.strip().split(None, 1)
-                if parts:
-                    out.append((parts[0], parts[1].strip() if len(parts) > 1 else parts[0]))
-            return out, None
+            return parse_cli_pairs(proc.stdout), None
 
         runner = AgyRunner(cfg)
         return asyncio.run(runner.list_models())

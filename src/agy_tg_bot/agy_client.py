@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BotConfig
+from .formatting import strip_ansi
 from .media import extract_image_paths_from_text
 from .models import SessionKey, SessionState, TokenUsage, ToolTrace, TurnProgress, TurnResult
 
@@ -257,7 +258,7 @@ class _PersistentWorker:
                 raw = await _read_line_unbounded(self.process.stderr)
                 if not raw:
                     break
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                line = strip_ansi(raw.decode("utf-8", errors="replace")).rstrip("\r\n")
                 if line:
                     self.stderr_history.append(line)
                     self.turn_stderr.append(line)
@@ -331,6 +332,40 @@ class _ActiveRun:
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self.process = process
         self.canceled = False
+
+
+def parse_cli_pairs(stdout: str) -> list[tuple[str, str]]:
+    """Parse TSV (`slug\\tLabel`) or multi-space-aligned (`slug   Label`) CLI table output."""
+    cleaned = strip_ansi(stdout)
+    items: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if (
+            low.startswith("available")
+            or low.startswith("fetching")
+            or line.startswith("---")
+            or line.startswith("===")
+        ):
+            continue
+
+        if "\t" in line:
+            slug_part, rest = line.split("\t", 1)
+            slug = slug_part.strip()
+            label = rest.strip() or slug
+        else:
+            parts = re.split(r"\s{2,}", line, maxsplit=1)
+            slug = parts[0].strip()
+            label = parts[1].strip() if len(parts) > 1 else slug
+
+        if not slug or " " in slug or slug in seen:
+            continue
+        seen.add(slug)
+        items.append((slug, label))
+    return items
 
 
 class AgyRunner:
@@ -675,7 +710,7 @@ class AgyRunner:
                     raw = await _read_line_unbounded(proc.stderr)
                     if not raw:
                         break
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    line = strip_ansi(raw.decode("utf-8", errors="replace")).rstrip("\r\n")
                     if line:
                         stderr_lines.append(line)
                         logger.debug("[agy oneshot stderr %s] %s", session.key.label, line)
@@ -1079,28 +1114,19 @@ class AgyRunner:
         """Run `agy models` and return [(slug, label), ...]."""
         code, stdout, stderr = await self._run_simple_cli(["models"], cwd=cwd, timeout=25.0)
         if code != 0:
-            return [], (stderr.strip() or stdout.strip() or f"agy models exited with {code}")
+            err = strip_ansi(stderr.strip() or stdout.strip() or f"agy models exited with {code}")
+            return [], err
+        return parse_cli_pairs(stdout), None
 
-        models: list[tuple[str, str]] = []
-        for raw_line in stdout.splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("Available") or line.startswith("---"):
-                continue
-            # Expected format from docs: "gemini-4-neon-xhigh            Gemini 4 Neon (XHigh)"
-            parts = re.split(r"\s{2,}", line, maxsplit=1)
-            slug = parts[0].strip()
-            if not slug or " " in slug:
-                continue
-            label = parts[1].strip() if len(parts) > 1 else slug
-            models.append((slug, label))
-        return models, None
-
-    async def list_agents(self, *, cwd: str | None = None) -> tuple[str, str | None]:
-        """Run `agy agents` and return raw output."""
+    async def list_agents(
+        self, *, cwd: str | None = None
+    ) -> tuple[list[tuple[str, str]], str | None]:
+        """Run `agy agents` and return [(name, description), ...]."""
         code, stdout, stderr = await self._run_simple_cli(["agents"], cwd=cwd, timeout=25.0)
         if code != 0:
-            return "", (stderr.strip() or stdout.strip() or f"agy agents exited with {code}")
-        return stdout.strip(), None
+            err = strip_ansi(stderr.strip() or stdout.strip() or f"agy agents exited with {code}")
+            return [], err
+        return parse_cli_pairs(stdout), None
 
     async def get_usage_report(self, *, cwd: str | None = None) -> tuple[str, str | None]:
         """Run standalone `agy -p /usage` without affecting any active stream session."""
@@ -1110,8 +1136,9 @@ class AgyRunner:
             timeout=35.0,
         )
         if code != 0:
-            return "", (stderr.strip() or stdout.strip() or f"agy -p /usage exited with {code}")
-        return (stdout.strip() or stderr.strip()), None
+            err = strip_ansi(stderr.strip() or stdout.strip() or f"agy -p /usage exited with {code}")
+            return "", err
+        return strip_ansi(stdout.strip() or stderr.strip()), None
 
 
 def _join_step_texts(step_texts: OrderedDict[int, list[str]]) -> str:

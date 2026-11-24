@@ -4,11 +4,181 @@ from __future__ import annotations
 
 import html
 import re
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .models import ToolTrace, TurnProgress, TurnResult
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096
 SAFE_RAW_CHUNK_LEN = 3400
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_MODEL_VARIANT_RE = re.compile(r"^(.*?)\s*\(([^()]+)\)\s*$")
+_EFFORT_ORDER: dict[str, int] = {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+    "max": 5,
+    "argon": 1,
+    "carbon": 2,
+    "neon": 3,
+}
+_USAGE_WINDOW_LABELS: dict[str, str] = {
+    "five hour limit remaining": "5 小时配额",
+    "weekly limit remaining": "每周配额",
+    "daily limit remaining": "每日配额",
+    "monthly limit remaining": "每月配额",
+}
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI terminal escape sequences from CLI output."""
+    if not text:
+        return ""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelVariant:
+    slug: str
+    label: str
+    variant: str
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelFamily:
+    name: str
+    variants: tuple[ModelVariant, ...]
+
+
+def group_models_by_family(models: list[tuple[str, str]]) -> list[ModelFamily]:
+    """Group `(slug, label)` entries like `Gemini 4 Hydrogen (XHigh)` by model family."""
+    grouped: OrderedDict[str, list[ModelVariant]] = OrderedDict()
+    for idx, (slug, label) in enumerate(models):
+        m = _MODEL_VARIANT_RE.match(label.strip())
+        if m:
+            family_name = m.group(1).strip()
+            variant_name = m.group(2).strip()
+        else:
+            family_name = label.strip() or slug
+            variant_name = "默认"
+        grouped.setdefault(family_name, []).append(
+            ModelVariant(slug=slug, label=label, variant=variant_name, index=idx)
+        )
+
+    families: list[ModelFamily] = []
+    for family_name, variants in grouped.items():
+        # Sort known effort/tier variants in intuitive low -> high order
+        if len(variants) > 1 and all(v.variant.lower() in _EFFORT_ORDER for v in variants):
+            variants = sorted(variants, key=lambda v: _EFFORT_ORDER[v.variant.lower()])
+        families.append(ModelFamily(name=family_name, variants=tuple(variants)))
+    return families
+
+
+def _render_progress_bar(pct: int, *, width: int = 10) -> str:
+    clamped = max(0, min(100, pct))
+    filled = round(clamped / 100 * width)
+    bar = "█" * filled + "░" * (width - filled)
+    if clamped >= 50:
+        dot = "🟢"
+    elif clamped >= 20:
+        dot = "🟡"
+    else:
+        dot = "🔴"
+    return f"{dot} <code>{bar}</code> <b>{clamped}%</b>"
+
+
+def _format_reset_time(iso_str: str, *, now: datetime | None = None) -> str:
+    raw = iso_str.strip()
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return html.escape(raw, quote=False)
+
+    ref = now or datetime.now(timezone.utc)
+    delta_secs = int((dt - ref).total_seconds())
+    utc_label = dt.astimezone(timezone.utc).strftime("%m-%d %H:%M UTC")
+    if delta_secs <= 0:
+        return f"即将重置（{utc_label}）"
+
+    days, rem = divmod(delta_secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts: list[str] = []
+    if days > 0:
+        parts.append(f"{days}天")
+    if hours > 0:
+        parts.append(f"{hours}小时")
+    if days == 0 and mins > 0:
+        parts.append(f"{mins}分")
+    rel = "".join(parts) or "不足1分"
+    return f"约 {rel}后重置（{utc_label}）"
+
+
+def render_usage_report_html(raw_report: str, *, now: datetime | None = None) -> str:
+    """Format `agy -p /usage` TSV output as clean mobile-friendly Telegram HTML cards."""
+    cleaned = strip_ansi(raw_report).strip()
+    if not cleaned:
+        return "📊 <b>AGY 配额与用量</b>\n<i>（暂无返回数据）</i>"
+
+    groups: OrderedDict[str, list[tuple[str, int | None, str, str]]] = OrderedDict()
+    parsed_any = False
+
+    for line in cleaned.splitlines():
+        if "\t" not in line:
+            continue
+        cols = [c.strip() for c in line.split("\t")]
+        if len(cols) < 3:
+            continue
+        group_name = cols[0]
+        window_raw = cols[1]
+        pct_raw = cols[2]
+        reset_raw = cols[3] if len(cols) >= 4 else ""
+
+        pct_match = re.search(r"(\d+)\s*%", pct_raw)
+        pct_val = int(pct_match.group(1)) if pct_match else None
+        window_label = _USAGE_WINDOW_LABELS.get(window_raw.lower(), window_raw)
+        groups.setdefault(group_name, []).append((window_label, pct_val, pct_raw, reset_raw))
+        parsed_any = True
+
+    if not parsed_any:
+        # Graceful fallback for non-TSV output (avoid ugly <pre> line wrapping)
+        pretty_lines = [
+            f"• {html.escape(ln.strip(), quote=False)}"
+            for ln in cleaned.splitlines()
+            if ln.strip()
+        ]
+        body = "\n".join(pretty_lines)[:3600]
+        return f"📊 <b>AGY 配额与用量</b>\n\n{body}"
+
+    sections: list[str] = ["📊 <b>AGY 配额与用量</b>"]
+    for group_name, rows in groups.items():
+        # Show shorter window (5-hour / daily) before weekly for quicker scanning
+        rows_sorted = sorted(
+            rows,
+            key=lambda r: (0 if ("5" in r[0] or "小时" in r[0] or "日" in r[0]) else 1),
+        )
+        block = [f"<b>{html.escape(group_name, quote=False)}</b>"]
+        for window_label, pct_val, pct_raw, reset_raw in rows_sorted:
+            if pct_val is not None:
+                bar_str = _render_progress_bar(pct_val)
+            else:
+                bar_str = f"<b>{html.escape(pct_raw, quote=False)}</b>"
+            line_str = f"• {html.escape(window_label, quote=False)}：{bar_str}"
+            if reset_raw:
+                reset_str = _format_reset_time(reset_raw, now=now)
+                line_str += f"\n  <i>⏱ {reset_str}</i>"
+            block.append(line_str)
+        sections.append("\n".join(block))
+
+    return "\n\n".join(sections)
 
 _FENCE_OPEN_RE = re.compile(r"^```([A-Za-z0-9_+\-.#]*)\s*$")
 _FENCE_CLOSE_RE = re.compile(r"^```\s*$")

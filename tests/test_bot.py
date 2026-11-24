@@ -283,3 +283,71 @@ async def test_deliver_result_auto_sends_images(tmp_path: Path) -> None:
     finally:
         await runner.stop()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_model_family_picker_includes_hydrogen_and_usage_no_pre_and_cd_pagination(
+    tmp_path: Path,
+) -> None:
+    from agy_tg_bot.models import SessionKey
+
+    bot, store, runner = _build_bot(tmp_path)
+    try:
+        key = SessionKey(100, 0)
+        session = store.get_or_create_session(key, bot.config)
+
+        # 1. /model shows grouped families including Gemini 4 Hydrogen, Claude, GPT-OSS
+        upd, msg = _make_update(user_id=100, text="/model")
+        await bot.cmd_model(upd, SimpleNamespace(args=[]))
+        picker_msg: _FakeMessage = msg.replies[0]["msg"]
+        last_edit = picker_msg.edits[-1]
+        assert "选择模型系列" in last_edit["text"]
+        btn_texts = [
+            btn.text
+            for row in last_edit["kwargs"]["reply_markup"].inline_keyboard
+            for btn in row
+        ]
+        assert any("Gemini 4 Hydrogen" in t for t in btn_texts)
+        assert any("Claude Opus 5.5" in t for t in btn_texts)
+        assert any("GPT-OSS 120B" in t for t in btn_texts)
+
+        # Open Hydrogen variants and select XHigh while effort was previously set -> effort auto-cleared
+        session.effort = "low"
+        store.save_session(session)
+        fam_idx = next(
+            i for i, f in enumerate(bot._model_families_cache[key]) if f.name == "Gemini 4 Hydrogen"
+        )
+        await bot._render_model_variants_view(picker_msg, key, session, fam_idx)
+        assert "gemini-4-hydrogen-xhigh" in picker_msg.edits[-1]["text"]
+
+        await bot._set_model(picker_msg, key, session, "gemini-4-hydrogen-xhigh", edit=True)
+        saved = store.get_or_create_session(key, bot.config)
+        assert saved.model == "gemini-4-hydrogen-xhigh"
+        assert saved.effort is None
+
+        # Changing effort to high swaps directly to sibling gemini-4-hydrogen-high!
+        await bot._set_effort(picker_msg, key, saved, "high", edit=True)
+        saved2 = store.get_or_create_session(key, bot.config)
+        assert saved2.model == "gemini-4-hydrogen-high"
+        assert saved2.effort is None
+
+        # 2. /usage renders rich cards (no <pre> code block!)
+        upd_u, msg_u = _make_update(user_id=100, text="/usage")
+        await bot.cmd_usage(upd_u, SimpleNamespace(args=[]))
+        usage_edit = msg_u.replies[0]["msg"].edits[-1]["text"]
+        assert "<pre>" not in usage_edit
+        assert "5 小时配额" in usage_edit
+        assert "62%" in usage_edit
+
+        # 3. /cd pagination handles >10 subdirectories without truncation
+        ws = Path(session.workspace)
+        for i in range(14):
+            (ws / f"dir_{i:02d}").mkdir()
+        upd_cd, msg_cd = _make_update(user_id=100, text="/cd")
+        await bot.cmd_cd(upd_cd, SimpleNamespace(args=[]))
+        cd_markup = msg_cd.replies[0]["kwargs"]["reply_markup"]
+        cd_cbs = [btn.callback_data for row in cd_markup.inline_keyboard for btn in row]
+        assert "cd_page:1" in cd_cbs
+    finally:
+        await runner.stop()
+        store.close()

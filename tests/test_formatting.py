@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from agy_tg_bot.formatting import (
     TELEGRAM_MAX_MESSAGE_LEN,
+    group_models_by_family,
     markdown_to_telegram_html,
     render_streaming_preview,
     render_telegram_html_chunks,
     render_turn_footer,
+    render_usage_report_html,
     split_markdown_chunks,
+    strip_ansi,
 )
 from agy_tg_bot.models import TokenUsage, ToolTrace, TurnProgress, TurnResult
 
@@ -81,3 +86,39 @@ def test_streaming_preview_and_footer() -> None:
     assert "1.5k tok" in footer
     assert "think 100" in footer
     assert "soft-denied" in footer
+
+
+def test_group_models_by_family_and_usage_cards_and_ansi_strip() -> None:
+    assert strip_ansi("\x1b[32mhello\x1b[0m") == "hello"
+
+    models = [
+        ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+        ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+        ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+        ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+    ]
+    families = group_models_by_family(models)
+    assert len(families) == 2
+    assert families[0].name == "Gemini 4 Hydrogen"
+    # Sorted Low -> High -> XHigh
+    assert [v.variant for v in families[0].variants] == ["Low", "High", "XHigh"]
+    assert families[1].name == "GPT-OSS 120B"
+
+    tsv = (
+        "Gemini Models\tWeekly Limit Remaining\t90%\t2026-12-01T07:40:02Z\n"
+        "Gemini Models\tFive Hour Limit Remaining\t42%\t2026-11-24T12:40:02Z\n"
+        "Claude and GPT models\tFive Hour Limit Remaining\t15%\t2026-11-24T13:57:49Z\n"
+    )
+    now = datetime(2026, 11, 24, 9, 0, 0, tzinfo=timezone.utc)
+    usage_html = render_usage_report_html(tsv, now=now)
+    assert "<pre>" not in usage_html
+    assert "<b>Gemini Models</b>" in usage_html
+    assert "5 小时配额" in usage_html
+    assert "每周配额" in usage_html
+    assert "42%" in usage_html
+    assert "🟡" in usage_html  # 42% yellow
+    assert "🟢" in usage_html  # 90% green
+    assert "🔴" in usage_html  # 15% red
+    assert "3小时40分后重置" in usage_html
+    # 5 小时配额 appears before 每周配额 inside Gemini Models
+    assert usage_html.index("5 小时配额") < usage_html.index("每周配额")
