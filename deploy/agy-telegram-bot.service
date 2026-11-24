@@ -1,0 +1,35 @@
+# System-level systemd unit
+#
+# Install path: /etc/systemd/system/agy-telegram-bot.service
+# Replace __USER__ and __APP_DIR__ (or let deploy/install.sh substitute them).
+#
+# Note: If using `agy` personal Google Account OAuth via Linux keyring/D-Bus,
+# prefer the user-level unit (`agy-telegram-bot-user.service`) with `loginctl enable-linger`.
+# This system unit works great with GEMINI_API_KEY, AGY_ADC_AUTH, or explicit D-Bus env.
+
+[Unit]
+Description=AGY Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+Environment=HOME=__HOME__
+Environment=PATH=__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AGY_CLI_DISABLE_AUTO_UPDATE=true
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__APP_DIR__/.venv/bin/agy-tg-bot --env-file __APP_DIR__/.env
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# Basic service hardening (keep ProtectHome=false so agy can access ~/.gemini and workspaces)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

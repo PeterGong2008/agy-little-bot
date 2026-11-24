@@ -1,0 +1,29 @@
+# User-level systemd unit (RECOMMENDED for VPS with `agy` SSH OAuth keyring login)
+#
+# Install path: ~/.config/systemd/user/agy-telegram-bot.service
+# Enable & keep running after SSH logout:
+#   sudo loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agy-telegram-bot
+#   journalctl --user -u agy-telegram-bot -f
+
+[Unit]
+Description=AGY Telegram Bot (User Service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__APP_DIR__/.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AGY_CLI_DISABLE_AUTO_UPDATE=true
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__APP_DIR__/.venv/bin/agy-tg-bot --env-file __APP_DIR__/.env
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

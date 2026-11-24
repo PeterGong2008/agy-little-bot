@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agy-telegram-bot"
+version = "0.1.0"
+description = "Production-ready Telegram Bot bridge for Google Antigravity CLI (agy) on Linux VPS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "python-telegram-bot>=21.6,<23.0",
+    "python-dotenv>=1.0.1,<2.0",
+]
+
+[project.optional-dependencies]
+proxy = [
+    "httpx[socks]>=0.27.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+agy-tg-bot = "agy_tg_bot.__main__:main"
+agy-tg-config = "agy_tg_bot.cli_config:main"
+agy-tg-doctor = "agy_tg_bot.doctor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["src"]
