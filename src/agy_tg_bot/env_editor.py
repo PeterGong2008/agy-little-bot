@@ -296,6 +296,22 @@ SETTING_SPECS: tuple[SettingSpec, ...] = (
         aliases=("verbose",),
     ),
     SettingSpec(
+        key="AUTO_SEND_IMAGES",
+        group="runtime",
+        label="自动发送对话中生成/引用的图片",
+        kind="bool",
+        default="true",
+        aliases=("images", "autoimg"),
+    ),
+    SettingSpec(
+        key="MAX_AUTO_IMAGES",
+        group="runtime",
+        label="单轮最多自动发送图片数量",
+        kind="int",
+        default="8",
+        min_val=1.0,
+    ),
+    SettingSpec(
         key="LONG_OUTPUT_FILE_THRESHOLD",
         group="runtime",
         label="超长回复附带 .md 阈值（字符，0=禁用）",

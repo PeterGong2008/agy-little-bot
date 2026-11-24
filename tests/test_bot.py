@@ -46,6 +46,15 @@ class _FakeMessage:
     async def reply_document(self, **kwargs) -> None:
         self.replies.append({"document": kwargs})
 
+    async def reply_photo(self, **kwargs) -> None:
+        self.replies.append({"photo": kwargs})
+
+    async def reply_animation(self, **kwargs) -> None:
+        self.replies.append({"animation": kwargs})
+
+    async def delete(self) -> None:
+        self.edits.append({"deleted": True})
+
 
 def _make_update(
     *,
@@ -193,6 +202,84 @@ async def test_callback_perm_confirm_and_sandbox_and_effort(tmp_path: Path) -> N
 
         # Verify `Message` import is usable in runtime environment
         assert Message is not None
+    finally:
+        await runner.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_control_panel_and_menu_actions(tmp_path: Path) -> None:
+    from agy_tg_bot.models import SessionKey
+
+    bot, store, runner = _build_bot(tmp_path, allow_danger=True)
+    try:
+        # /start sends interactive control panel
+        upd, msg = _make_update(user_id=100, text="/start")
+        await bot.cmd_panel(upd, SimpleNamespace(args=[]))
+        assert len(msg.replies) == 1
+        panel_text = msg.replies[0]["text"]
+        assert "AGY 交互式控制面板" in panel_text
+        markup = msg.replies[0]["kwargs"]["reply_markup"]
+        callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+        assert "menu:new" in callbacks
+        assert "menu:perm" in callbacks
+        assert "menu:model" in callbacks
+        assert "menu:cd" in callbacks
+        assert "menu:toggle_sandbox" in callbacks
+
+        # Simulate menu callback actions directly on _handle_menu_callback
+        panel_msg: _FakeMessage = msg.replies[0]["msg"]
+        fake_query = SimpleNamespace(answer=AsyncMock())
+        key = SessionKey(100, 0)
+        session = store.get_or_create_session(key, bot.config)
+
+        await bot._handle_menu_callback(fake_query, panel_msg, key, session, "toggle_sandbox")
+        assert store.get_or_create_session(key, bot.config).sandbox is True
+        assert "沙箱：✅" in panel_msg.edits[-1]["text"]
+
+        await bot._handle_menu_callback(fake_query, panel_msg, key, session, "toggle_runner")
+        assert store.get_or_create_session(key, bot.config).runner_mode == "oneshot"
+
+        await bot._handle_menu_callback(fake_query, panel_msg, key, session, "perm")
+        assert "请选择新的权限模式" in panel_msg.edits[-1]["text"]
+
+        await bot._handle_menu_callback(fake_query, panel_msg, key, session, "close")
+        assert panel_msg.edits[-1].get("deleted") is True
+    finally:
+        await runner.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_deliver_result_auto_sends_images(tmp_path: Path) -> None:
+    import time
+
+    from agy_tg_bot.models import SessionKey, TurnResult
+
+    bot, store, runner = _build_bot(tmp_path)
+    try:
+        key = SessionKey(100, 0)
+        session = store.get_or_create_session(key, bot.config)
+        ws = Path(session.workspace)
+
+        turn_start = time.time()
+        img = ws / "output_chart.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\nfakeimagebytes")
+
+        _, user_msg = _make_update(user_id=100, text="draw chart")
+        status_msg = await user_msg.reply_text("⏳")
+        res = TurnResult(
+            conversation_id="conv-img-1",
+            status="SUCCESS",
+            response="Chart saved to ![chart](output_chart.png)",
+        )
+        await bot._deliver_result(
+            user_msg, status_msg, session, res, turn_started_at=turn_start
+        )
+
+        photo_replies = [r for r in user_msg.replies if "photo" in r]
+        assert len(photo_replies) == 1
+        assert "output_chart.png" in photo_replies[0]["photo"]["caption"]
     finally:
         await runner.stop()
         store.close()

@@ -16,9 +16,12 @@
   - **Fail-Closed 用户白名单**：未配置 `ALLOWED_USER_IDS` 时拒绝启动。
   - **五档权限策略可随时切换（`/perm`）**：`default` / `auto` / `accept-edits` / `plan` / `danger`（`--dangerously-skip-permissions`，带二次确认且可通过 `ALLOW_DANGEROUS_MODE=false` 彻底锁定）。
   - 支持 `--sandbox` 终端沙箱切换（`/sandbox`）及 `ALLOWED_WORKSPACE_ROOTS` 目录边界限制。
-- **双向文件传输与群组话题隔离**：
+- **双向文件与图片自动直发**：
   - 发送图片、文档、语音/音频给 Bot，自动保存至 `<工作区>/.tg_inbox/` 并通知 `agy` 读取分析。
-  - 使用 `/get <路径>` 直接从 VPS 拉取日志、构建产物或代码文件到 Telegram。
+  - **对话图片自动发送**：`agy` 在回复或工具执行中生成/引用的本地图片（`.png`/`.jpg`/`.webp`/`.gif`/`.bmp`），以及本轮在工作区新生成的图表/截图，都会自动直接发送到 Telegram 对话中（大图或不支持尺寸自动降级为原图文档发送，且不会重复回发 `.tg_inbox/` 中的用户上传图）。
+  - 使用 `/get <路径>` 可按需从 VPS 拉取任意日志、构建产物或代码文件到 Telegram。
+- **交互式控制面板（`/start` / `/menu`）与群组话题隔离**：
+  - 发送 `/start` 或 `/menu` 即可呼出可视化按钮控制面板，一键完成新建对话、模型/推理强度/权限模式切换、沙箱/引擎/详细轨迹开关、目录逐层浏览、历史恢复与配额查看。
   - 支持 Telegram 群组 **Forum Topics**，每个话题独立维护工作区、模型与会话上下文。
 - **自带交互式配置命令行（`agy-tg-config`）、VPS 诊断工具（`agy-tg-doctor`）与 `systemd` 一键部署脚本**。
 
@@ -185,7 +188,8 @@ journalctl --user -u agy-telegram-bot -f
 
 | 指令 | 说明 |
 | --- | --- |
-| 直接发文本 / 图片 / 文件 | 发送提示词给 `agy`；附件自动存入 `<workspace>/.tg_inbox/` 供 `agy` 读取 |
+| 直接发文本 / 图片 / 文件 | 发送提示词给 `agy`；附件自动存入 `<workspace>/.tg_inbox/`；AGY 生成/引用的图片自动回发 |
+| `/start`（或 `/menu`） | 打开交互式控制面板（内联按钮一站式控制所有设置） |
 | `/help` | 查看指令菜单 |
 | `/new`（或 `/clear`） | 开启全新对话（清空当前 `conversation_id`） |
 | `/cancel`（或 `/stop`） | 立即中止正在执行的任务（也可直接点消息底部的 `🛑 中止任务` 按钮） |

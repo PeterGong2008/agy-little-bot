@@ -35,6 +35,7 @@ from .formatting import (
     render_telegram_html_chunks,
     render_turn_footer,
 )
+from .media import collect_turn_images, should_send_as_photo
 from .models import (
     VALID_EFFORT_LEVELS,
     VALID_PERMISSION_MODES,
@@ -165,7 +166,8 @@ class AgyTelegramBot:
         app = builder.build()
 
         # Core commands
-        app.add_handler(CommandHandler(["start", "help"], self.cmd_help))
+        app.add_handler(CommandHandler(["start", "menu"], self.cmd_panel))
+        app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler(["new", "clear"], self.cmd_new))
         app.add_handler(CommandHandler(["cancel", "stop"], self.cmd_cancel))
         app.add_handler(CommandHandler("status", self.cmd_status))
@@ -210,6 +212,8 @@ class AgyTelegramBot:
     async def _post_init(self, app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         await self.runner.start()
         commands = [
+            BotCommand("start", "打开交互式控制面板"),
+            BotCommand("menu", "打开交互式控制面板"),
             BotCommand("help", "查看命令与使用说明"),
             BotCommand("new", "开启全新对话"),
             BotCommand("cancel", "中止当前正在执行的任务"),
@@ -247,19 +251,84 @@ class AgyTelegramBot:
         logger.error("Unhandled Telegram update error", exc_info=context.error)
 
     # ------------------------------------------------------------------
-    # Command handlers
+    # Interactive Control Panel (/start & /menu)
     # ------------------------------------------------------------------
 
-    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._authorize(update):
-            return
-        msg = update.effective_message
-        if msg is None:
-            return
+    @staticmethod
+    def _back_to_panel_row() -> list[InlineKeyboardButton]:
+        return [InlineKeyboardButton("⬅️ 返回主面板", callback_data="menu:home")]
+
+    def _build_panel_view(
+        self, key: SessionKey, session: SessionState
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        worker_badge = "🟢 热进程" if self.runner.has_live_worker(key) else "⚪ 按需启动"
+        busy_badge = "⚙️ 执行中" if self.runner.is_running(key) else "空闲"
+        cid_short = session.conversation_id[:8] if session.conversation_id else "新会话"
+        runner_label = "常驻流式" if session.runner_mode == "persistent" else "单次按需"
+
         text = (
+            "🎛 <b>AGY 交互式控制面板</b>\n"
+            f"• 状态：{busy_badge} | 进程：{worker_badge}\n"
+            f"• 工作区：<code>{html.escape(session.workspace)}</code>\n"
+            f"• 对话 ID：<code>{html.escape(cid_short)}</code>\n"
+            f"• 模型：<code>{html.escape(session.model or 'CLI 默认')}</code>"
+            f" | 强度：<code>{html.escape(session.effort or '默认')}</code>\n"
+            f"• 权限：<code>{html.escape(session.permission_mode)}</code>"
+            f" | 沙箱：{'✅' if session.sandbox else '❌'}"
+            f" | 引擎：<code>{html.escape(session.runner_mode)}</code>\n"
+            f"• 详细轨迹：{'✅' if session.verbose else '❌'}"
+            f" | 自动发图：{'✅' if self.config.auto_send_images else '❌'}\n\n"
+            "<i>点击下方按钮快速切换设置，或直接发送文字/图片开始对话。</i>"
+        )
+
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton("🆕 新建对话", callback_data="menu:new"),
+                InlineKeyboardButton("🔄 刷新状态", callback_data="menu:home"),
+            ],
+            [
+                InlineKeyboardButton("🧠 切换模型", callback_data="menu:model"),
+                InlineKeyboardButton("⚡ 推理强度", callback_data="menu:effort"),
+            ],
+            [
+                InlineKeyboardButton("🔐 权限模式", callback_data="menu:perm"),
+                InlineKeyboardButton(
+                    f"🛡 沙箱: {'开' if session.sandbox else '关'}",
+                    callback_data="menu:toggle_sandbox",
+                ),
+            ],
+            [
+                InlineKeyboardButton("📂 切换目录", callback_data="menu:cd"),
+                InlineKeyboardButton("📜 历史会话", callback_data="menu:history"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"⚙️ 引擎: {runner_label}",
+                    callback_data="menu:toggle_runner",
+                ),
+                InlineKeyboardButton(
+                    f"📝 详情: {'开' if session.verbose else '关'}",
+                    callback_data="menu:toggle_verbose",
+                ),
+            ],
+            [
+                InlineKeyboardButton("📊 配额用量", callback_data="menu:usage"),
+                InlineKeyboardButton("♻️ 重启进程", callback_data="menu:restart"),
+            ],
+            [
+                InlineKeyboardButton("❓ 命令帮助", callback_data="menu:help"),
+                InlineKeyboardButton("✖️ 关闭面板", callback_data="menu:close"),
+            ],
+        ]
+        return text, InlineKeyboardMarkup(rows)
+
+    def _build_help_text(self) -> str:
+        return (
             "🤖 <b>AGY VPS Telegram Bot</b>\n"
-            "直接发送任意文本、图片或文件即可与 VPS 本机 <code>agy</code> 交互。\n\n"
-            "<b>会话管理</b>\n"
+            "直接发送任意文本、图片或文件即可与 VPS 本机 <code>agy</code> 交互；"
+            "对话中生成或引用的图片将自动发送回 Telegram。\n\n"
+            "<b>控制面板与会话</b>\n"
+            "• /start 或 /menu — 打开交互式控制面板\n"
             "• /new — 开启全新对话\n"
             "• /cancel — 中止当前正在执行的任务\n"
             "• /status — 查看当前状态、工作区、模型与权限\n"
@@ -269,7 +338,7 @@ class AgyTelegramBot:
             "<b>VPS 工作区与文件</b>\n"
             "• /cd <code>[路径]</code> — 切换或浏览工作目录\n"
             "• /ls <code>[路径]</code> — 查看目录内容\n"
-            "• /get <code>&lt;路径&gt;</code> — 下载 VPS 文件到 Telegram\n"
+            "• /get <code>&lt;路径&gt;</code> — 下载 VPS 任意文件到 Telegram\n"
             "• 直接发送图片/文件 — 自动保存到工作区 <code>.tg_inbox/</code> 并交给 agy 读取\n\n"
             "<b>权限与模型配置</b>\n"
             "• /perm <code>[default|auto|accept-edits|plan|danger]</code> — 切换工具权限\n"
@@ -283,7 +352,32 @@ class AgyTelegramBot:
             "• /pass <code>&lt;内容&gt;</code> — 透传自定义 Skill（如 <code>/pass /my-skill</code>）\n\n"
             "<i>支持透传的 AGY 指令：/goal /plan /compact /boost /learn /btw /swarm /teamwork</i>"
         )
-        await self._safe_reply_html(msg, text)
+
+    async def cmd_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update):
+            return
+        msg = update.effective_message
+        key = _extract_session_key(update)
+        if msg is None or key is None:
+            return
+        session = self.store.get_or_create_session(key, self.config)
+        text, markup = self._build_panel_view(key, session)
+        await self._safe_reply_html(msg, text, reply_markup=markup)
+
+    # ------------------------------------------------------------------
+    # Command handlers
+    # ------------------------------------------------------------------
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update):
+            return
+        msg = update.effective_message
+        if msg is None:
+            return
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🎛 打开交互式控制面板", callback_data="menu:home")]]
+        )
+        await self._safe_reply_html(msg, self._build_help_text(), reply_markup=markup)
 
     async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -363,7 +457,13 @@ class AgyTelegramBot:
         await self._apply_cd(msg, key, session, target)
 
     async def _send_cd_browser(
-        self, msg: Message, key: SessionKey, session: SessionState
+        self,
+        msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        *,
+        edit: bool = False,
+        include_back: bool = True,
     ) -> None:
         cwd = Path(session.workspace)
         choices: list[tuple[str, str]] = []
@@ -394,12 +494,18 @@ class AgyTelegramBot:
             else:
                 rows.append([btn])
 
+        if include_back:
+            rows.append(self._back_to_panel_row())
+
         markup = InlineKeyboardMarkup(rows) if rows else None
         text = (
             f"📂 当前工作目录：<code>{html.escape(session.workspace)}</code>\n"
             "点击下方目录快速切换，或输入 <code>/cd &lt;路径&gt;</code>。"
         )
-        await self._safe_reply_html(msg, text, reply_markup=markup)
+        if edit:
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+        else:
+            await self._safe_reply_html(msg, text, reply_markup=markup)
 
     async def _apply_cd(
         self,
@@ -410,10 +516,11 @@ class AgyTelegramBot:
         *,
         edit: bool = False,
     ) -> None:
+        back_markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if edit else None
         if not self.config.is_path_allowed(target):
             err = f"⛔ 目标路径不在允许的根目录范围内：<code>{html.escape(str(target))}</code>"
             if edit:
-                await self._safe_edit_html(msg, err)
+                await self._safe_edit_html(msg, err, reply_markup=back_markup)
             else:
                 await self._safe_reply_html(msg, err)
             return
@@ -421,7 +528,7 @@ class AgyTelegramBot:
         if not target.exists() or not target.is_dir():
             err = f"❌ 目录不存在：<code>{html.escape(str(target))}</code>"
             if edit:
-                await self._safe_edit_html(msg, err)
+                await self._safe_edit_html(msg, err, reply_markup=back_markup)
             else:
                 await self._safe_reply_html(msg, err)
             return
@@ -434,14 +541,16 @@ class AgyTelegramBot:
             session.conversation_id = None
             self.store.save_session(session)
 
+        if edit:
+            # Refresh directory browser in-place so the user can keep navigating effortlessly
+            await self._send_cd_browser(msg, key, session, edit=True, include_back=True)
+            return
+
         reply = (
             f"📂 已切换工作区至：\n<code>{html.escape(session.workspace)}</code>\n"
             "<i>已重置对话上下文，下一条消息将在新目录启动 agy。</i>"
         )
-        if edit:
-            await self._safe_edit_html(msg, reply)
-        else:
-            await self._safe_reply_html(msg, reply)
+        await self._safe_reply_html(msg, reply)
 
     async def cmd_ls(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -558,7 +667,9 @@ class AgyTelegramBot:
 
         await self._set_permission_mode(msg, key, session, arg, edit=False)
 
-    def _build_perm_keyboard(self, current: str) -> InlineKeyboardMarkup:
+    def _build_perm_keyboard(
+        self, current: str, *, include_back: bool = True
+    ) -> InlineKeyboardMarkup:
         rows: list[list[InlineKeyboardButton]] = []
         for mode in VALID_PERMISSION_MODES:
             if mode == "danger" and not self.config.allow_dangerous_mode:
@@ -568,6 +679,8 @@ class AgyTelegramBot:
             if mode == "danger":
                 label = f"{mark}⚠️ danger (skip-permissions)"
             rows.append([InlineKeyboardButton(label, callback_data=f"perm:{mode}")])
+        if include_back:
+            rows.append(self._back_to_panel_row())
         return InlineKeyboardMarkup(rows)
 
     async def _send_danger_confirm(self, msg: Message, *, edit: bool) -> None:
@@ -611,7 +724,9 @@ class AgyTelegramBot:
             "<i>对话上下文已保留，下一条消息将按新权限模式生效。</i>"
         )
         if edit:
-            await self._safe_edit_html(msg, text)
+            await self._safe_edit_html(
+                msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
+            )
         else:
             await self._safe_reply_html(msg, text)
 
@@ -713,12 +828,24 @@ class AgyTelegramBot:
             return
 
         status_msg = await self._safe_reply_html(msg, "🔍 正在查询 <code>agy models</code>…")
+        await self._open_model_picker(status_msg, key, session, include_back=True)
+
+    async def _open_model_picker(
+        self,
+        target_msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        *,
+        include_back: bool = True,
+    ) -> None:
         models, err = await self.runner.list_models(cwd=session.workspace)
+        back_markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if include_back else None
         if err:
             await self._safe_edit_html(
-                status_msg,
+                target_msg,
                 f"❌ 获取模型列表失败：\n<pre>{html.escape(err[:1500])}</pre>\n"
                 "你仍可直接手动设置：<code>/model &lt;slug&gt;</code> 或 <code>/model default</code>",
+                reply_markup=back_markup,
             )
             return
 
@@ -734,10 +861,12 @@ class AgyTelegramBot:
         for idx, (slug, label) in enumerate(models[:20]):
             mark = "✅ " if session.model == slug else ""
             rows.append([InlineKeyboardButton(f"{mark}{label}"[:48], callback_data=f"model:{idx}")])
+        if include_back:
+            rows.append(self._back_to_panel_row())
 
         cur = session.model or "CLI 默认"
         await self._safe_edit_html(
-            status_msg,
+            target_msg,
             f"🧠 当前模型：<code>{html.escape(cur)}</code>\n点击下方按钮切换，或执行 <code>/model &lt;slug&gt;</code>：",
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -758,9 +887,31 @@ class AgyTelegramBot:
         label = model or "CLI 默认"
         text = f"🧠 已设置模型为：<code>{html.escape(label)}</code>"
         if edit:
-            await self._safe_edit_html(msg, text)
+            await self._safe_edit_html(
+                msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
+            )
         else:
             await self._safe_reply_html(msg, text)
+
+    def _build_effort_keyboard(
+        self, current: str | None, *, include_back: bool = True
+    ) -> InlineKeyboardMarkup:
+        buttons = [
+            InlineKeyboardButton(
+                ("✅ " if current is None else "") + "default",
+                callback_data="effort:default",
+            )
+        ] + [
+            InlineKeyboardButton(
+                ("✅ " if current == lvl else "") + lvl,
+                callback_data=f"effort:{lvl}",
+            )
+            for lvl in VALID_EFFORT_LEVELS
+        ]
+        rows = [buttons[:3], buttons[3:]]
+        if include_back:
+            rows.append(self._back_to_panel_row())
+        return InlineKeyboardMarkup(rows)
 
     async def cmd_effort(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -772,23 +923,10 @@ class AgyTelegramBot:
         session = self.store.get_or_create_session(key, self.config)
 
         if not context.args:
-            buttons = [
-                InlineKeyboardButton(
-                    ("✅ " if session.effort is None else "") + "default",
-                    callback_data="effort:default",
-                )
-            ] + [
-                InlineKeyboardButton(
-                    ("✅ " if session.effort == lvl else "") + lvl,
-                    callback_data=f"effort:{lvl}",
-                )
-                for lvl in VALID_EFFORT_LEVELS
-            ]
-            rows = [buttons[:3], buttons[3:]]
             await self._safe_reply_html(
                 msg,
                 f"⚡ 当前推理强度：<code>{html.escape(session.effort or 'CLI 默认')}</code>",
-                reply_markup=InlineKeyboardMarkup(rows),
+                reply_markup=self._build_effort_keyboard(session.effort, include_back=True),
             )
             return
 
@@ -821,7 +959,9 @@ class AgyTelegramBot:
             await self.runner.close_worker(key, graceful=True)
         text = f"⚡ 推理强度已设为：<code>{html.escape(effort or 'CLI 默认')}</code>"
         if edit:
-            await self._safe_edit_html(msg, text)
+            await self._safe_edit_html(
+                msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
+            )
         else:
             await self._safe_reply_html(msg, text)
 
@@ -870,28 +1010,33 @@ class AgyTelegramBot:
             return
         session = self.store.get_or_create_session(key, self.config)
         status_msg = await self._safe_reply_html(msg, "📊 正在查询 <code>agy -p /usage</code>…")
+        await self._open_usage_view(status_msg, session, include_back=True)
+
+    async def _open_usage_view(
+        self, target_msg: Message, session: SessionState, *, include_back: bool = True
+    ) -> None:
+        back_markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if include_back else None
         report, err = await self.runner.get_usage_report(cwd=session.workspace)
         if err:
             await self._safe_edit_html(
-                status_msg, f"❌ 查询用量失败：\n<pre>{html.escape(err[:2000])}</pre>"
+                target_msg,
+                f"❌ 查询用量失败：\n<pre>{html.escape(err[:2000])}</pre>",
+                reply_markup=back_markup,
             )
             return
         await self._safe_edit_html(
-            status_msg, f"📊 <b>AGY 配额与用量</b>\n<pre>{html.escape(report[:3500])}</pre>"
+            target_msg,
+            f"📊 <b>AGY 配额与用量</b>\n<pre>{html.escape(report[:3500])}</pre>",
+            reply_markup=back_markup,
         )
 
-    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._authorize(update):
-            return
-        msg = update.effective_message
-        key = _extract_session_key(update)
-        if msg is None or key is None:
-            return
-        session = self.store.get_or_create_session(key, self.config)
+    def _build_history_view(
+        self, key: SessionKey, session: SessionState, *, include_back: bool = True
+    ) -> tuple[str, InlineKeyboardMarkup | None]:
         records = self.store.list_conversations(key, limit=8)
         if not records:
-            await self._safe_reply_html(msg, "📜 暂无历史会话记录。")
-            return
+            markup = InlineKeyboardMarkup([self._back_to_panel_row()]) if include_back else None
+            return "📜 暂无历史会话记录。", markup
 
         lines = ["📜 <b>最近会话记录</b>（点击按钮直接恢复）："]
         rows: list[list[InlineKeyboardButton]] = []
@@ -909,10 +1054,20 @@ class AgyTelegramBot:
             rows.append(
                 [InlineKeyboardButton(btn_label, callback_data=f"resume:{rec.conversation_id[:36]}")]
             )
+        if include_back:
+            rows.append(self._back_to_panel_row())
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
 
-        await self._safe_reply_html(
-            msg, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows)
-        )
+    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update):
+            return
+        msg = update.effective_message
+        key = _extract_session_key(update)
+        if msg is None or key is None:
+            return
+        session = self.store.get_or_create_session(key, self.config)
+        text, markup = self._build_history_view(key, session, include_back=True)
+        await self._safe_reply_html(msg, text, reply_markup=markup)
 
     async def cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -947,7 +1102,9 @@ class AgyTelegramBot:
             "下一条消息将通过 <code>--conversation</code> 自动续接上下文。"
         )
         if edit:
-            await self._safe_edit_html(msg, text)
+            await self._safe_edit_html(
+                msg, text, reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()])
+            )
         else:
             await self._safe_reply_html(msg, text)
 
@@ -1055,16 +1212,25 @@ class AgyTelegramBot:
                 )
             return
 
+        session = self.store.get_or_create_session(key, self.config)
+
+        # Interactive Control Panel callbacks (`menu:*`)
+        if data.startswith("menu:"):
+            await self._handle_menu_callback(query, msg, key, session, data.split(":", 1)[1])
+            return
+
         with contextlib.suppress(TelegramError):
             await query.answer()
-
-        session = self.store.get_or_create_session(key, self.config)
 
         if data.startswith("perm:"):
             mode = data.split(":", 1)[1]
             if mode == "danger":
                 if not self.config.allow_dangerous_mode:
-                    await self._safe_edit_html(msg, "⛔ 服务器配置已禁用 danger 模式。")
+                    await self._safe_edit_html(
+                        msg,
+                        "⛔ 服务器配置已禁用 danger 模式。",
+                        reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+                    )
                     return
                 await self._send_danger_confirm(msg, edit=True)
                 return
@@ -1076,13 +1242,18 @@ class AgyTelegramBot:
             if self.config.allow_dangerous_mode:
                 await self._set_permission_mode(msg, key, session, "danger", edit=True)
             else:
-                await self._safe_edit_html(msg, "⛔ 服务器配置已禁用 danger 模式。")
+                await self._safe_edit_html(
+                    msg,
+                    "⛔ 服务器配置已禁用 danger 模式。",
+                    reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+                )
             return
 
         if data == "perm_cancel":
             await self._safe_edit_html(
                 msg,
                 f"已取消切换。当前权限模式仍为：<b>{html.escape(session.permission_mode)}</b>",
+                reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
             )
             return
 
@@ -1108,7 +1279,11 @@ class AgyTelegramBot:
                 cached = self._model_cache.get(key) or []
                 slug = cached[idx][0]
             except (ValueError, IndexError):
-                await self._safe_edit_html(msg, "⚠️ 模型列表已过期，请重新发送 /model。")
+                await self._safe_edit_html(
+                    msg,
+                    "⚠️ 模型列表已过期，请点击下方返回或重新发送 /model。",
+                    reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+                )
                 return
             await self._set_model(msg, key, session, slug, edit=True)
             return
@@ -1123,10 +1298,153 @@ class AgyTelegramBot:
                 idx = int(data.split(":", 1)[1])
                 path_str = (self._cd_cache.get(key) or [])[idx]
             except (ValueError, IndexError):
-                await self._safe_edit_html(msg, "⚠️ 目录列表已过期，请重新发送 /cd。")
+                await self._safe_edit_html(
+                    msg,
+                    "⚠️ 目录列表已过期，请点击下方返回或重新发送 /cd。",
+                    reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+                )
                 return
             await self._apply_cd(msg, key, session, Path(path_str), edit=True)
             return
+
+    async def _handle_menu_callback(
+        self,
+        query: Any,
+        msg: Message,
+        key: SessionKey,
+        session: SessionState,
+        action: str,
+    ) -> None:
+        if action == "home":
+            with contextlib.suppress(TelegramError):
+                await query.answer("已刷新状态")
+            text, markup = self._build_panel_view(key, session)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "new":
+            if self.runner.is_running(key):
+                await self.runner.cancel_turn(key)
+            await self.runner.close_worker(key, graceful=True)
+            session.conversation_id = None
+            self.store.save_session(session)
+            with contextlib.suppress(TelegramError):
+                await query.answer("🆕 已开启全新对话")
+            text, markup = self._build_panel_view(key, session)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "restart":
+            if self.runner.is_running(key):
+                await self.runner.cancel_turn(key)
+            await self.runner.close_worker(key, graceful=True)
+            with contextlib.suppress(TelegramError):
+                await query.answer("♻️ 已重启后台进程（保留上下文）")
+            text, markup = self._build_panel_view(key, session)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "toggle_sandbox":
+            session.sandbox = not session.sandbox
+            self.store.save_session(session)
+            await self.runner.close_worker(key, graceful=True)
+            with contextlib.suppress(TelegramError):
+                await query.answer(f"🛡 终端沙箱已{'开启' if session.sandbox else '关闭'}")
+            text, markup = self._build_panel_view(key, session)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "toggle_runner":
+            session.runner_mode = "oneshot" if session.runner_mode == "persistent" else "persistent"
+            self.store.save_session(session)
+            await self.runner.close_worker(key, graceful=True)
+            with contextlib.suppress(TelegramError):
+                await query.answer(f"⚙️ 已切换引擎为 {session.runner_mode}")
+            text, markup = self._build_panel_view(key, session)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "toggle_verbose":
+            session.verbose = not session.verbose
+            self.store.save_session(session)
+            with contextlib.suppress(TelegramError):
+                await query.answer(f"📝 详细轨迹已{'开启' if session.verbose else '关闭'}")
+            text, markup = self._build_panel_view(key, session)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "perm":
+            with contextlib.suppress(TelegramError):
+                await query.answer()
+            cur_desc = PERM_DESCRIPTIONS.get(session.permission_mode, session.permission_mode)
+            await self._safe_edit_html(
+                msg,
+                f"🔐 当前权限模式：<b>{html.escape(session.permission_mode)}</b>\n"
+                f"{html.escape(cur_desc)}\n\n请选择新的权限模式：",
+                reply_markup=self._build_perm_keyboard(session.permission_mode, include_back=True),
+            )
+            return
+
+        if action == "model":
+            with contextlib.suppress(TelegramError):
+                await query.answer("正在查询可用模型…")
+            await self._safe_edit_html(msg, "🔍 正在查询 <code>agy models</code>…")
+            await self._open_model_picker(msg, key, session, include_back=True)
+            return
+
+        if action == "effort":
+            with contextlib.suppress(TelegramError):
+                await query.answer()
+            await self._safe_edit_html(
+                msg,
+                f"⚡ 当前推理强度：<code>{html.escape(session.effort or 'CLI 默认')}</code>\n请选择：",
+                reply_markup=self._build_effort_keyboard(session.effort, include_back=True),
+            )
+            return
+
+        if action == "cd":
+            with contextlib.suppress(TelegramError):
+                await query.answer()
+            await self._send_cd_browser(msg, key, session, edit=True, include_back=True)
+            return
+
+        if action == "history":
+            with contextlib.suppress(TelegramError):
+                await query.answer()
+            text, markup = self._build_history_view(key, session, include_back=True)
+            await self._safe_edit_html(msg, text, reply_markup=markup)
+            return
+
+        if action == "usage":
+            with contextlib.suppress(TelegramError):
+                await query.answer("正在查询用量…")
+            await self._safe_edit_html(msg, "📊 正在查询 <code>agy -p /usage</code>…")
+            await self._open_usage_view(msg, session, include_back=True)
+            return
+
+        if action == "help":
+            with contextlib.suppress(TelegramError):
+                await query.answer()
+            await self._safe_edit_html(
+                msg,
+                self._build_help_text(),
+                reply_markup=InlineKeyboardMarkup([self._back_to_panel_row()]),
+            )
+            return
+
+        if action == "close":
+            with contextlib.suppress(TelegramError):
+                await query.answer("面板已关闭")
+            try:
+                await msg.delete()
+            except TelegramError:
+                await self._safe_edit_html(
+                    msg, "🎛 控制面板已关闭（发送 /start 或 /menu 可随时重新打开）。"
+                )
+            return
+
+        with contextlib.suppress(TelegramError):
+            await query.answer()
 
     # ------------------------------------------------------------------
     # Message & Media handlers
@@ -1288,6 +1606,7 @@ class AgyTelegramBot:
                     except TelegramError as exc:
                         logger.debug("Streaming edit TelegramError: %s", exc)
 
+            turn_started_wall = time.time()
             try:
                 result = await self.runner.run_turn(session, prompt, on_progress=_on_progress)
             finally:
@@ -1309,7 +1628,13 @@ class AgyTelegramBot:
                     total_tokens=result.usage.total_tokens,
                 )
 
-            await self._deliver_result(msg, status_msg, session, result)
+            await self._deliver_result(
+                msg,
+                status_msg,
+                session,
+                result,
+                turn_started_at=turn_started_wall,
+            )
 
     async def _deliver_result(
         self,
@@ -1317,6 +1642,8 @@ class AgyTelegramBot:
         status_msg: Message,
         session: SessionState,
         result: TurnResult,
+        *,
+        turn_started_at: float = 0.0,
     ) -> None:
         footer_html = render_turn_footer(result, verbose=session.verbose)
 
@@ -1348,11 +1675,17 @@ class AgyTelegramBot:
             if footer_html:
                 empty_msg += f"\n\n{footer_html}"
             await self._safe_edit_html(status_msg, empty_msg)
+            await self._send_turn_images(
+                user_msg, session, result, turn_started_at=turn_started_at
+            )
             return
 
         chunks = render_telegram_html_chunks(raw_response)
         if not chunks:
             await self._safe_edit_html(status_msg, "✅ 执行完成")
+            await self._send_turn_images(
+                user_msg, session, result, turn_started_at=turn_started_at
+            )
             return
 
         # Deliver first chunk by editing the placeholder status message (removing cancel button)
@@ -1379,6 +1712,11 @@ class AgyTelegramBot:
         if footer_html and not footer_attached:
             await self._safe_reply_html(user_msg, footer_html)
 
+        # Automatically send images generated or referenced during the turn
+        await self._send_turn_images(
+            user_msg, session, result, turn_started_at=turn_started_at
+        )
+
         # Attach full Markdown document for very long outputs
         threshold = self.config.long_output_file_threshold
         if threshold > 0 and len(raw_response) >= threshold:
@@ -1391,6 +1729,82 @@ class AgyTelegramBot:
                     filename=buf.name,
                     caption="📄 完整 Markdown 回复附件",
                 )
+
+    async def _send_turn_images(
+        self,
+        user_msg: Message,
+        session: SessionState,
+        result: TurnResult,
+        *,
+        turn_started_at: float,
+    ) -> None:
+        if not self.config.auto_send_images:
+            return
+        images = collect_turn_images(
+            response_text=result.response,
+            tool_candidates=result.image_candidates,
+            workspace=session.workspace,
+            config=self.config,
+            turn_started_at=turn_started_at or time.time(),
+        )
+        if not images:
+            return
+
+        ws_path = Path(session.workspace).expanduser().resolve()
+        for img_path in images:
+            try:
+                caption_path = str(img_path.relative_to(ws_path))
+            except ValueError:
+                caption_path = img_path.name
+            caption = f"🖼 {caption_path}"[:1000]
+            await self._safe_send_image(user_msg, img_path, caption=caption)
+
+    async def _safe_send_image(self, user_msg: Message, img_path: Path, *, caption: str) -> None:
+        ext = img_path.suffix.lower()
+        for attempt in range(2):
+            try:
+                if ext == ".gif":
+                    try:
+                        with img_path.open("rb") as fh:
+                            await user_msg.reply_animation(
+                                animation=fh,
+                                filename=img_path.name,
+                                caption=caption,
+                            )
+                        return
+                    except TelegramError:
+                        pass
+
+                if should_send_as_photo(img_path):
+                    try:
+                        with img_path.open("rb") as fh:
+                            await user_msg.reply_photo(photo=fh, caption=caption)
+                        return
+                    except RetryAfter:
+                        raise
+                    except TelegramError as exc:
+                        logger.info(
+                            "reply_photo failed for %s (%s); falling back to reply_document",
+                            img_path,
+                            exc,
+                        )
+
+                with img_path.open("rb") as fh:
+                    await user_msg.reply_document(
+                        document=fh,
+                        filename=img_path.name,
+                        caption=caption,
+                    )
+                return
+            except RetryAfter as exc:
+                if attempt == 0:
+                    await asyncio.sleep(float(exc.retry_after) + 0.5)
+                    continue
+                logger.warning("Rate limited while sending image %s", img_path)
+                return
+            except (OSError, TelegramError) as exc:
+                logger.warning("Failed to send image %s: %s", img_path, exc)
+                return
 
     async def _typing_heartbeat(self, msg: Message, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():

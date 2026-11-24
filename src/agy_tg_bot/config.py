@@ -139,6 +139,8 @@ class BotConfig:
     max_upload_mb: int
     db_path: str
     log_level: str
+    auto_send_images: bool = True
+    max_auto_images: int = 8
 
     def is_user_authorized(self, user_id: int | None, chat_id: int | None) -> bool:
         """Strict fail-closed authorization check."""
@@ -259,6 +261,8 @@ def load_config(
         os.environ.get("STREAM_EDIT_INTERVAL_SECONDS"), 1.2, min_val=0.3
     )
     default_verbose = _parse_bool(os.environ.get("DEFAULT_VERBOSE"), True)
+    auto_send_images = _parse_bool(os.environ.get("AUTO_SEND_IMAGES"), True)
+    max_auto_images = _parse_int(os.environ.get("MAX_AUTO_IMAGES"), 8, min_val=1)
     long_output_threshold = _parse_int(
         os.environ.get("LONG_OUTPUT_FILE_THRESHOLD"), 12000, min_val=0
     )
@@ -298,6 +302,8 @@ def load_config(
         max_upload_mb=max_upload_mb,
         db_path=db_path,
         log_level=log_level,
+        auto_send_images=auto_send_images,
+        max_auto_images=max_auto_images,
     )
 
     if allowed_roots and not cfg.is_path_allowed(default_ws_path):

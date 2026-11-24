@@ -157,6 +157,7 @@ class TurnResult:
     usage: TokenUsage = field(default_factory=TokenUsage)
     turn_usage: TokenUsage = field(default_factory=TokenUsage)
     tools: list[ToolTrace] = field(default_factory=list)
+    image_candidates: list[str] = field(default_factory=list)
     stderr_lines: list[str] = field(default_factory=list)
     permission_denials: list[str] = field(default_factory=list)
     effective_permission_mode: str | None = None

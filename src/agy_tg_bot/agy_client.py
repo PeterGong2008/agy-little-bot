@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BotConfig
+from .media import extract_image_paths_from_text
 from .models import SessionKey, SessionState, TokenUsage, ToolTrace, TurnProgress, TurnResult
 
 logger = logging.getLogger(__name__)
@@ -741,6 +742,7 @@ class AgyRunner:
         effective_perm = initial_perm_mode
         step_texts: OrderedDict[int, list[str]] = OrderedDict()
         tools_by_step: OrderedDict[int, ToolTrace] = OrderedDict()
+        tool_image_candidates: list[str] = []
         non_json_lines: list[str] = []
         got_any_event = False
 
@@ -820,6 +822,20 @@ class AgyRunner:
                     tool_name = su.get("tool_name")
 
                     if step_type == "tool" or tool_name or tool_info or subagent_info:
+                        if isinstance(tool_info, dict):
+                            tool_out = tool_info.get("output")
+                            if isinstance(tool_out, str) and tool_out:
+                                for img_p in extract_image_paths_from_text(tool_out):
+                                    if img_p not in tool_image_candidates:
+                                        tool_image_candidates.append(img_p)
+                            tool_params = tool_info.get("parameters")
+                            if isinstance(tool_params, dict):
+                                for pv in tool_params.values():
+                                    if isinstance(pv, str) and pv:
+                                        for img_p in extract_image_paths_from_text(pv):
+                                            if img_p not in tool_image_candidates:
+                                                tool_image_candidates.append(img_p)
+
                         if subagent_info:
                             display_name, summary = _summarize_subagent(subagent_info)
                             is_sub = True
@@ -911,6 +927,7 @@ class AgyRunner:
                         usage=usage,
                         turn_usage=turn_usage,
                         tools=list(tools_by_step.values()),
+                        image_candidates=list(tool_image_candidates),
                         stderr_lines=list(stderr_lines),
                         permission_denials=denials,
                         effective_permission_mode=effective_perm,
